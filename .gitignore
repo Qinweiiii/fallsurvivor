@@ -1,0 +1,43 @@
+# ---- secrets ----
+.env
+.env.local
+*.pem
+*.key
+
+# ---- browser login state (NEVER commit) ----
+worker-browser/.auth/
+worker-browser/.auth
+**/storage-state*.json
+**/user-data-dir/
+
+# ---- uploads / local data ----
+storage/
+uploads/
+*.db
+*.sqlite
+
+# ---- go ----
+backend/bin/
+backend/tmp/
+*.test
+coverage.out
+
+# ---- node ----
+node_modules/
+.next/
+out/
+dist/
+build/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+playwright-report/
+test-results/
+.playwright/
+
+# ---- os / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

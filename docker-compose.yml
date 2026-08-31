@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jobos-postgres
+    environment:
+      POSTGRES_DB: jobos
+      POSTGRES_USER: jobos
+      # 无默认密码：必须由 .env 提供
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobos -d jobos"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: jobos-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jobos-backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://jobos:${POSTGRES_PASSWORD}@postgres:5432/jobos?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+    command: ["/app/server"]
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage:/app/storage
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jobos-worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://jobos:${POSTGRES_PASSWORD}@postgres:5432/jobos?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+    command: ["/app/worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage:/app/storage
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jobos-frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:9090/api
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+
+# 说明：Playwright Worker 刻意不放进 compose。
+# 它需要打开用户可见的本地浏览器、由用户手动登录并处理验证码，
+# 因此第一版固定运行在宿主机：cd worker-browser && npm run dev
+volumes:
+  pgdata:
+  redisdata:

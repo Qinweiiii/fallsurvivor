@@ -1,0 +1,5 @@
+# 登录态目录：绝对不可提交
+.auth/
+*.log
+node_modules/
+dist/

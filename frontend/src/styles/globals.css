@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-sans: ui-sans-serif, system-ui;
+  }
+
+  html,
+  body {
+    @apply h-full;
+  }
+
+  body {
+    /* 多层径向渐变 + 线性底色，让背景看起来像彩色光晕 */
+    @apply text-ink-800 antialiased;
+    background-image: theme('backgroundImage.dreamy');
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+
+  /* 柔和的滚动条 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-pill bg-lilac-200;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-lilac-300;
+  }
+
+  /* 统一焦点样式，保证键盘可达性 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-lilac-400 ring-offset-2 ring-offset-white;
+  }
+
+  /* 选区颜色，避免默认的硬蓝 */
+  ::selection {
+    background-color: rgba(244, 100, 159, 0.18);
+    color: #3d2a63;
+  }
+}
+
+@layer components {
+  /* 卡片：圆角 + 柔和阴影 + 半透明白色背景 */
+  .card {
+    @apply rounded-card border border-white/70 bg-white/85 shadow-card backdrop-blur-sm;
+  }
+
+  .card-tinted {
+    @apply rounded-card border border-white/70 shadow-card backdrop-blur-sm;
+  }
+
+  /* 表格容器 */
+  .table-shell {
+    @apply overflow-hidden rounded-card border border-white/70 bg-white/90 shadow-card backdrop-blur-sm;
+  }
+
+  /* 表头：清晰规整优先 */
+  .th {
+    @apply whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-ink-500;
+  }
+
+  /* 单元格 */
+  .td {
+    @apply px-4 py-3 text-sm text-ink-700;
+  }
+
+  /* 单元格：含「|」分隔的多行内容（如腾讯校招多部门字符串）需保留换行。 */
+  .td-preline {
+    @apply px-4 py-3 text-sm text-ink-700;
+    white-space: pre-line;
+  }
+
+  /* 输入控件 */
+  .input {
+    @apply w-full rounded-xl border border-ink-200 bg-white/90 px-3 py-2 text-sm text-ink-800
+      placeholder:text-ink-400 transition
+      focus:border-lilac-400 focus:outline-none focus:ring-2 focus:ring-lilac-200;
+  }
+
+  .label-text {
+    @apply mb-1.5 block text-xs font-medium text-ink-500;
+  }
+
+  /* 渐变主按钮使用 bg-btn-primary 类名 */
+  .btn-gradient {
+    background-image: theme('backgroundImage.btn-primary');
+    @apply text-white shadow-soft transition hover:opacity-95 active:opacity-90 disabled:opacity-50;
+  }
+}
