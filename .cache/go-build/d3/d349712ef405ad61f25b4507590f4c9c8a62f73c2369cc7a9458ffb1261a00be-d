@@ -1,6 +1,0 @@
-./application_repo.go
-./db.go
-./job_repo.go
-./search_cart_repo.go
-./site_recipe_repo.go
-./user_repo.go

@@ -1,4 +1,0 @@
-./redact.go
-./sensitive.go
-./redact_card_test.go
-./security_test.go
