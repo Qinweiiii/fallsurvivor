@@ -2,8 +2,15 @@
 
 import { useState } from 'react';
 import useSWR from 'swr';
-import { fetcher, siteRecipesApi } from '@/lib/api';
-import type { SiteRecipe, SiteRecipeRun, SiteStrategy } from '@/lib/types';
+import { fetcher, jobsApi, siteRecipesApi } from '@/lib/api';
+import type {
+  SiteCrawlResult,
+  SiteRecipe,
+  SiteRecipeFieldQuality,
+  SiteRecipeRun,
+  SiteStrategy,
+  SiteVerifyStatus,
+} from '@/lib/types';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/Button';
 import { ErrorState, Skeleton } from '@/components/ui/States';
@@ -16,6 +23,7 @@ interface ListData {
 const STRATEGY_LABEL: Record<SiteStrategy, string> = {
   browser: '浏览器抽取',
   api: '接口直调',
+  browser_observed: '浏览器页面观测',
   url_template: 'URL 模板',
 };
 
@@ -23,6 +31,27 @@ const SOURCE_LABEL: Record<string, string> = {
   preset: '内置',
   manual: '手动',
   exploration: '探索',
+};
+
+/**
+ * 验证状态的展示样式。
+ *
+ * 这一列是整个自愈闭环对用户最直观的体现：
+ * 「已验证」= Agent 自己试跑通过；「已失效」= 下次会自动重新摸索。
+ */
+const VERIFY_STYLE: Record<SiteVerifyStatus, { label: string; className: string }> = {
+  verified: { label: '已验证', className: 'bg-emerald-50 text-emerald-700' },
+  unverified: { label: '未验证', className: 'bg-ink-100 text-ink-500' },
+  invalid: { label: '已失效 · 待重探', className: 'bg-rose-50 text-rose-700' },
+};
+
+const FIELD_LABELS: Record<string, string> = {
+  title: '岗位',
+  description: '职责/要求',
+  company: '公司',
+  location: '地点',
+  department: '部门',
+  business: '业务',
 };
 
 /** 新建配置的初始草稿。 */
@@ -34,6 +63,20 @@ function blankDraft(): Partial<SiteRecipe> {
     campus_url: '',
     strategy_type: 'browser',
     adapter_key: '',
+    list_api: '',
+    detail_api: '',
+    detail_url_template: '',
+    method: 'GET',
+    id_field: '',
+    title_field: '',
+    list_path: '',
+    keyword_param: '',
+    field_map: {},
+    request_body: '',
+    request_content_type: '',
+    request_headers: {},
+    keyword_in_body: false,
+    verify_status: 'unverified',
     enabled: true,
     max_jobs_per_search: 20,
     max_detail_fetches: 8,
@@ -48,6 +91,8 @@ export default function SiteRecipesPage() {
   const [isNew, setIsNew] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [lastVerify, setLastVerify] = useState<Record<string, SiteRecipeFieldQuality[]>>({});
+  const [lastCrawl, setLastCrawl] = useState<Record<string, SiteCrawlResult>>({});
 
   function startCreate() {
     setEditing(blankDraft());
@@ -95,6 +140,65 @@ export default function SiteRecipesPage() {
     }
   }
 
+  /**
+   * 用真实请求验证一条配置。
+   *
+   * 这是「配置能不能跑」的唯一可信答案——读配置猜不出来，
+   * 只能发一次真实请求看是否解析出岗位。结果会写回健康度，
+   * 因此完成后要刷新列表让状态徽标同步。
+   */
+  async function verify(recipe: SiteRecipe) {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await siteRecipesApi.verify(recipe.id);
+      setLastVerify((prev) => ({ ...prev, [recipe.id]: res.field_quality ?? [] }));
+      if (res.ok) {
+        const samples = res.sample_titles?.length ? `：${res.sample_titles.join(' / ')}` : '';
+        setMsg(`「${recipe.company_name}」验证通过，采到 ${res.jobs_found} 条${samples}`);
+      } else {
+        setMsg(`「${recipe.company_name}」验证失败：${res.error ?? '未知原因'}`);
+      }
+      await mutate();
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '验证失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function crawlRecipe(recipe: SiteRecipe, mode: 'explore' | 'crawl') {
+    if (!recipe.campus_url) {
+      setMsg(`「${recipe.company_name}」缺少校招入口 URL`);
+      return;
+    }
+    const keyword = window.prompt('输入本次检索关键词', '算法');
+    if (keyword === null) return;
+
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await jobsApi.crawl({
+        site_key: recipe.site_key,
+        company: recipe.company_name,
+        url: recipe.campus_url,
+        keyword: keyword.trim(),
+        strategy: mode === 'explore' ? 'explore' : undefined,
+        save_as_recipe: mode === 'explore',
+      });
+      setLastCrawl((prev) => ({ ...prev, [recipe.id]: res }));
+      if (res.field_quality) {
+        setLastVerify((prev) => ({ ...prev, [recipe.id]: res.field_quality ?? [] }));
+      }
+      setMsg(formatCrawlMessage(recipe.company_name, res));
+      await mutate();
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '采集失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -127,8 +231,13 @@ export default function SiteRecipesPage() {
                 key={r.id}
                 recipe={r}
                 busy={busy}
+                fieldQuality={lastCrawl[r.id]?.field_quality ?? lastVerify[r.id]}
+                crawlResult={lastCrawl[r.id]}
                 onEdit={() => startEdit(r)}
                 onDelete={() => remove(r.id, r.company_name)}
+                onVerify={() => verify(r)}
+                onExplore={() => void crawlRecipe(r, 'explore')}
+                onCrawl={() => void crawlRecipe(r, 'crawl')}
               />
             ))}
           </div>
@@ -149,19 +258,42 @@ export default function SiteRecipesPage() {
   );
 }
 
+function formatCrawlMessage(company: string, res: SiteCrawlResult): string {
+  if (res.ingest_status === 'not_started') {
+    const samples = res.verify_samples?.length ? `：${res.verify_samples.join(' / ')}` : '';
+    return `「${company}」路径探索通过，验证采到 ${res.verified_jobs ?? res.count} 条${samples}`;
+  }
+  const parts = [`「${company}」采集完成：发现 ${res.count}`];
+  if (res.ingested !== undefined) parts.push(`新增 ${res.ingested}`);
+  if (res.duplicate !== undefined) parts.push(`重复 ${res.duplicate}`);
+  if (res.skipped !== undefined && res.skipped > 0) parts.push(`跳过 ${res.skipped}`);
+  return parts.join('，');
+}
+
 /** 单个站点配置卡片。 */
 function RecipeCard({
   recipe,
   busy,
+  fieldQuality,
+  crawlResult,
   onEdit,
   onDelete,
+  onVerify,
+  onExplore,
+  onCrawl,
 }: {
   recipe: SiteRecipe;
   busy: boolean;
+  fieldQuality?: SiteRecipeFieldQuality[];
+  crawlResult?: SiteCrawlResult;
   onEdit: () => void;
   onDelete: () => void;
+  onVerify: () => void;
+  onExplore: () => void;
+  onCrawl: () => void;
 }) {
   const [showRuns, setShowRuns] = useState(false);
+  const verify = VERIFY_STYLE[recipe.verify_status] ?? VERIFY_STYLE.unverified;
 
   return (
     <div
@@ -171,10 +303,13 @@ function RecipeCard({
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-base font-semibold text-ink-800">{recipe.company_name}</h3>
             <span className="rounded-pill bg-card-lilac px-2 py-0.5 text-[10px] font-semibold text-lilac-700">
               {STRATEGY_LABEL[recipe.strategy_type] ?? recipe.strategy_type}
+            </span>
+            <span className={`rounded-pill px-2 py-0.5 text-[10px] font-semibold ${verify.className}`}>
+              {verify.label}
             </span>
             <span className="rounded-pill bg-ink-50 px-2 py-0.5 text-[10px] text-ink-500">
               {SOURCE_LABEL[recipe.source] ?? recipe.source} v{recipe.version}
@@ -195,7 +330,27 @@ function RecipeCard({
             <p className="mt-1 truncate text-xs text-ink-400">入口：{recipe.campus_url}</p>
           )}
 
-          <div className="mt-2 flex gap-4 text-xs text-ink-500">
+          {/* 接口策略：把「实际怎么发这个请求」摊开给用户看。
+              这些值由 Agent 从真实请求沉淀，是排查采集问题的第一现场。 */}
+          {(recipe.strategy_type === 'api' || recipe.strategy_type === 'browser_observed') && recipe.list_api && (
+            <div className="mt-2 space-y-1 rounded-lg bg-ink-50/70 px-3 py-2">
+              <p className="break-all font-mono text-[11px] text-ink-600">
+                <span className="font-semibold text-ink-500">{recipe.method}</span> {recipe.list_api}
+              </p>
+              <p className="font-mono text-[11px] text-ink-500">
+                list_path={recipe.list_path || '-'} · title={recipe.title_field || '-'}
+                {recipe.keyword_param &&
+                  ` · keyword=${recipe.keyword_param}${recipe.keyword_in_body ? '（请求体）' : '（query）'}`}
+              </p>
+              {recipe.request_body && (
+                <p className="break-all font-mono text-[11px] text-ink-500">
+                  body[{recipe.request_content_type || 'application/json'}]：{recipe.request_body}
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="mt-2 flex flex-wrap gap-4 text-xs text-ink-500">
             <span>单次最多 {recipe.max_jobs_per_search} 条</span>
             <span>
               详情抓取{' '}
@@ -203,7 +358,19 @@ function RecipeCard({
                 ? '不抓（用抽取阶段 JD）'
                 : `${recipe.max_detail_fetches} 条`}
             </span>
+            {recipe.verify_status === 'verified' && recipe.verified_jobs > 0 && (
+              <span className="text-emerald-600">验证时采到 {recipe.verified_jobs} 条</span>
+            )}
+            {recipe.consecutive_failures > 0 && (
+              <span className="text-rose-600">连续失败 {recipe.consecutive_failures} 次</span>
+            )}
           </div>
+
+          {recipe.last_error && (
+            <p className="mt-2 rounded-lg bg-rose-50 px-3 py-2 text-xs leading-relaxed text-rose-700">
+              最近失败：{recipe.last_error}
+            </p>
+          )}
 
           {recipe.notes && (
             <p className="mt-2 rounded-lg bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-600">
@@ -212,7 +379,20 @@ function RecipeCard({
           )}
         </div>
 
-        <div className="flex shrink-0 gap-2">
+        <div className="flex shrink-0 flex-col gap-2">
+          <Button variant="secondary" onClick={onCrawl} disabled={busy || !recipe.enabled}>
+            采集入库
+          </Button>
+          <Button variant="ghost" onClick={onExplore} disabled={busy || !recipe.enabled}>
+            探索路径
+          </Button>
+          {/* 仅接口策略可独立验证：浏览器策略依赖登录态与会话，
+              无法脱离会话复现，只能通过实际执行一次采集来确认。 */}
+          {recipe.strategy_type === 'api' && (
+            <Button variant="ghost" onClick={onVerify} disabled={busy}>
+              验证
+            </Button>
+          )}
           <Button variant="ghost" onClick={() => setShowRuns(!showRuns)}>
             执行记录
           </Button>
@@ -225,7 +405,128 @@ function RecipeCard({
         </div>
       </div>
 
+      {crawlResult && <CrawlResultSummary result={crawlResult} />}
       {showRuns && <RunList recipeId={recipe.id} />}
+      {fieldQuality && fieldQuality.length > 0 && <FieldQualityList items={fieldQuality} />}
+    </div>
+  );
+}
+
+function CrawlResultSummary({ result }: { result: SiteCrawlResult }) {
+  const samples =
+    result.verify_samples?.length ? result.verify_samples : result.jobs.map((job) => job.title).filter(Boolean);
+  const trace = result.trace ?? [];
+  const candidate = result.candidate;
+  const fieldMap = candidate?.field_map ? Object.entries(candidate.field_map) : [];
+
+  return (
+    <div className="mt-3 border-t border-lilac-50 pt-3 text-xs text-ink-600">
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        <span>{result.strategy}</span>
+        <span>发现 {result.count}</span>
+        {result.duration_ms !== undefined && <span>耗时 {(result.duration_ms / 1000).toFixed(1)}s</span>}
+        {result.refine_rounds !== undefined && <span>修正 {result.refine_rounds} 轮</span>}
+        {result.verified !== undefined && (
+          <span className={result.verified ? 'text-emerald-600' : 'text-rose-600'}>
+            {result.verified ? '已验证' : '未验证'}
+          </span>
+        )}
+        {result.ingest_status === 'not_started' ? (
+          <span className="text-amber-700">未入库</span>
+        ) : (
+          <>
+            {result.ingested !== undefined && <span>新增 {result.ingested}</span>}
+            {result.duplicate !== undefined && <span>重复 {result.duplicate}</span>}
+            {result.skipped !== undefined && result.skipped > 0 && <span>跳过 {result.skipped}</span>}
+          </>
+        )}
+      </div>
+      {samples.length > 0 && (
+        <p className="mt-1 truncate text-ink-500">样例：{samples.slice(0, 3).join(' / ')}</p>
+      )}
+      {result.next_action && <p className="mt-1 text-amber-700">{result.next_action}</p>}
+
+      {(candidate || trace.length > 0) && (
+        <div className="mt-3 space-y-2">
+          {candidate && (
+            <details className="border-l-2 border-lilac-100 pl-3">
+              <summary className="cursor-pointer text-xs font-semibold text-ink-600">
+                候选采集配置
+                {candidate.confidence !== undefined && ` · 置信度 ${candidate.confidence}`}
+              </summary>
+              <div className="mt-2 space-y-1 font-mono text-[11px] text-ink-500">
+                <p className="break-all">
+                  <span className="font-semibold">{candidate.method || 'GET'}</span>{' '}
+                  {candidate.list_api || '-'}
+                </p>
+                <p className="break-all">
+                  list_path={candidate.list_path || '-'} · title={candidate.title_field || '-'}
+                  {candidate.keyword_param &&
+                    ` · keyword=${candidate.keyword_param}${candidate.keyword_in_body ? '（请求体）' : '（query）'}`}
+                </p>
+                {fieldMap.length > 0 && (
+                  <p className="break-all">
+                    field_map：
+                    {fieldMap
+                      .map(([key, value]) => `${key}=${value}`)
+                      .slice(0, 8)
+                      .join('；')}
+                  </p>
+                )}
+                {candidate.notes && <p className="whitespace-pre-wrap font-sans text-ink-500">{candidate.notes}</p>}
+              </div>
+            </details>
+          )}
+
+          {trace.length > 0 && (
+            <details className="border-l-2 border-lilac-100 pl-3">
+              <summary className="cursor-pointer text-xs font-semibold text-ink-600">
+                探索轨迹 · {trace.length} 步
+              </summary>
+              <ol className="mt-2 space-y-2">
+                {trace.map((step) => (
+                  <li key={`${step.step}-${step.action}-${step.target ?? ''}`}>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-500">
+                      <span className="font-semibold text-ink-700">#{step.step}</span>
+                      <span>{step.action}</span>
+                      {step.target && <span className="break-all">target={step.target}</span>}
+                      {step.confidence !== undefined && <span>confidence={step.confidence}</span>}
+                      {step.new_requests !== undefined && <span>requests={step.new_requests}</span>}
+                    </div>
+                    {step.result && <p className="mt-0.5 text-[11px] text-ink-600">{step.result}</p>}
+                    {step.reasoning && (
+                      <p className="mt-0.5 text-[11px] leading-relaxed text-ink-400">{step.reasoning}</p>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FieldQualityList({ items }: { items: SiteRecipeFieldQuality[] }) {
+  return (
+    <div className="mt-3 border-t border-lilac-50 pt-3">
+      <p className="mb-2 text-xs font-semibold text-ink-500">最近验证字段质量</p>
+      <div className="flex flex-wrap gap-2">
+        {items.map((item) => (
+          <span
+            key={item.field}
+            className={
+              item.ok
+                ? 'rounded-pill bg-emerald-50 px-2 py-1 text-[11px] text-emerald-700'
+                : 'rounded-pill bg-rose-50 px-2 py-1 text-[11px] text-rose-700'
+            }
+            title={item.samples?.join(' / ') || '未命中样例'}
+          >
+            {FIELD_LABELS[item.field] ?? item.field} {item.hit}/{item.total}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -358,8 +659,9 @@ function EditModal({
               value={draft.strategy_type ?? 'browser'}
               onChange={(e) => set('strategy_type', e.target.value as SiteStrategy)}
             >
-              <option value="browser">浏览器抽取（已实现）</option>
-              <option value="api">接口直调（未实现）</option>
+              <option value="browser">浏览器抽取（复用站点适配器）</option>
+              <option value="api">接口直调（GET / POST 均支持）</option>
+              <option value="browser_observed">浏览器页面观测（触发页面请求）</option>
               <option value="url_template">URL 模板（未实现）</option>
             </select>
           </Field>
@@ -372,6 +674,125 @@ function EditModal({
               placeholder="tencent"
             />
           </Field>
+
+          {(draft.strategy_type === 'api' || draft.strategy_type === 'browser_observed') && (
+            <>
+              <Field label="列表 API">
+                <input
+                  className="input"
+                  value={draft.list_api ?? ''}
+                  onChange={(e) => set('list_api', e.target.value)}
+                  placeholder="https://example.com/api/jobs?keyword=后端"
+                />
+              </Field>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="方法">
+                  <select
+                    className="input"
+                    value={draft.method ?? 'GET'}
+                    onChange={(e) => set('method', e.target.value as 'GET' | 'POST')}
+                  >
+                    <option value="GET">GET</option>
+                    <option value="POST">POST</option>
+                  </select>
+                </Field>
+                <Field label="关键词参数">
+                  <input
+                    className="input"
+                    value={draft.keyword_param ?? ''}
+                    onChange={(e) => set('keyword_param', e.target.value)}
+                    placeholder="keyword"
+                  />
+                </Field>
+              </div>
+
+              <label className="flex items-center gap-2 text-sm text-ink-700">
+                <input
+                  type="checkbox"
+                  checked={draft.keyword_in_body ?? false}
+                  onChange={(e) => set('keyword_in_body', e.target.checked)}
+                />
+                关键词放在请求体里（而非 URL query）
+              </label>
+
+              {/* POST 请求侧配置：这是让新站点「不用改代码就能接」的关键。
+                  值通常由探索 Agent 自动填好，人工只在需要微调时才动。 */}
+              {draft.method === 'POST' && (
+                <>
+                  <Field label="请求体类型">
+                    <select
+                      className="input"
+                      value={draft.request_content_type ?? ''}
+                      onChange={(e) => set('request_content_type', e.target.value)}
+                    >
+                      <option value="">application/json（默认）</option>
+                      <option value="application/json">application/json</option>
+                      <option value="application/x-www-form-urlencoded">
+                        application/x-www-form-urlencoded
+                      </option>
+                    </select>
+                  </Field>
+
+                  <Field label="请求体（JSON；可用 {keyword} 占位关键词）">
+                    <textarea
+                      className="input min-h-[70px] font-mono text-xs"
+                      value={draft.request_body ?? ''}
+                      onChange={(e) => set('request_body', e.target.value)}
+                      placeholder='{"pageSize":20,"keyword":"{keyword}"}'
+                    />
+                  </Field>
+                </>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="列表路径">
+                  <input
+                    className="input"
+                    value={draft.list_path ?? ''}
+                    onChange={(e) => set('list_path', e.target.value)}
+                    placeholder="data.positionList"
+                  />
+                </Field>
+                <Field label="标题字段">
+                  <input
+                    className="input"
+                    value={draft.title_field ?? ''}
+                    onChange={(e) => set('title_field', e.target.value)}
+                    placeholder="positionTitle"
+                  />
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="ID 字段">
+                  <input
+                    className="input"
+                    value={draft.id_field ?? ''}
+                    onChange={(e) => set('id_field', e.target.value)}
+                    placeholder="postId"
+                  />
+                </Field>
+                <Field label="详情页模板">
+                  <input
+                    className="input"
+                    value={draft.detail_url_template ?? ''}
+                    onChange={(e) => set('detail_url_template', e.target.value)}
+                    placeholder="https://example.com/job/{id}"
+                  />
+                </Field>
+              </div>
+
+              <Field label="详情 API 模板">
+                <input
+                  className="input"
+                  value={draft.detail_api ?? ''}
+                  onChange={(e) => set('detail_api', e.target.value)}
+                  placeholder="https://example.com/api/job/{id}"
+                />
+              </Field>
+            </>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <Field label="单次最多返回">

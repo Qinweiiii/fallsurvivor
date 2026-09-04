@@ -4,7 +4,7 @@ import useSWR from 'swr';
 import { useState } from 'react';
 import { api, fetcher, ApiError } from '@/lib/api';
 import type { ApplicationDetail, StatusOption } from '@/lib/types';
-import { APP_STATUS_LABELS, formatRelative, orDash } from '@/lib/utils';
+import { APP_STATUS_LABELS, firstDisplayValue, formatRelative, orDash } from '@/lib/utils';
 import { Drawer } from '@/components/ui/Drawer';
 import { Button } from '@/components/ui/Button';
 import { Badge, appStatusToneOf } from '@/components/ui/Badge';
@@ -57,7 +57,11 @@ export function ApplicationDrawer({ applicationId, onClose, onChanged }: Applica
       open={Boolean(applicationId)}
       onClose={onClose}
       title={data?.job?.title ?? '投递任务'}
-      subtitle={data?.job ? `${data.job.company_name}${data.job.department ? ` · ${data.job.department}` : ''}` : undefined}
+      subtitle={
+        data?.job
+          ? `${data.job.company_name}${firstDisplayValue(data.job.department) ? ` · ${firstDisplayValue(data.job.department)}` : ''}`
+          : undefined
+      }
       footer={
         app ? (
           <div className="space-y-2.5">

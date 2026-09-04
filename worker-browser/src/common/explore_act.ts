@@ -13,7 +13,7 @@
  *   4. 有界：元素与请求条数都有上限，避免上下文爆炸。
  */
 
-import type { Page } from 'playwright';
+import type { ElementHandle, Page } from 'playwright';
 import type { SnapshotElement } from '../types.js';
 import { redact } from './sensitive_guard.js';
 
@@ -49,49 +49,77 @@ export async function takeSnapshot(page: Page): Promise<{
   title: string;
   currentUrl: string;
   elements: SnapshotElement[];
+  refs: Map<string, ElementHandle<HTMLElement>>;
   textSample: string;
   cardSamples: string[];
 }> {
   const currentUrl = page.url();
   const title = await page.title().catch(() => '');
 
+  const elements: SnapshotElement[] = [];
+  const refs = new Map<string, ElementHandle<HTMLElement>>();
+  const selector =
+    'a, button, input, select, textarea, [contenteditable="true"], ' +
+    '[role="button"], [role="tab"], [role="link"], [role="combobox"], [onclick]';
+
+  const handles = await page.$$(selector).catch(() => []);
+  for (const rawHandle of handles) {
+    const handle = rawHandle as ElementHandle<HTMLElement>;
+    if (elements.length >= MAX_ELEMENTS) {
+      await handle.dispose().catch(() => undefined);
+      continue;
+    }
+    const meta = await handle
+      .evaluate((node: HTMLElement) => {
+        const htmlEl = node;
+        const rect = htmlEl.getBoundingClientRect();
+        const style = window.getComputedStyle(htmlEl);
+        const visible =
+          rect.width > 0 &&
+          rect.height > 0 &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.opacity !== '0';
+        if (!visible) return null;
+
+        const input = node as HTMLInputElement;
+        const text = (htmlEl.innerText ?? htmlEl.textContent ?? '').replace(/\s+/g, ' ').trim();
+        const tag = htmlEl.tagName.toLowerCase();
+        const role = htmlEl.getAttribute('role') ?? '';
+        const inputType = tag === 'input' ? input.type : tag;
+		const href = htmlEl instanceof HTMLAnchorElement ? htmlEl.href : '';
+        return {
+          tag,
+          role,
+          text: text.slice(0, 120),
+          placeholder: (input.placeholder ?? '').slice(0, 80),
+          aria_label: (htmlEl.getAttribute('aria-label') ?? '').slice(0, 120),
+          input_type: inputType,
+		  href,
+          visible: true,
+        };
+      })
+      .catch(() => null);
+
+    if (!meta) {
+      await handle.dispose().catch(() => undefined);
+      continue;
+    }
+    const label = meta.text || meta.placeholder || meta.aria_label || meta.role;
+    if (!label) {
+      await handle.dispose().catch(() => undefined);
+      continue;
+    }
+
+    const ref = makeRef('el', elements.length + 1);
+    elements.push({ ref, ...meta });
+    refs.set(ref, handle);
+  }
+
   const data = await page
     .evaluate(
       (arg) => {
-        const maxElements = arg.maxElements;
-        const out: SnapshotElement[] = [];
         const cards: string[] = [];
-
-        // 1. 可交互元素。
-        const nodes = document.querySelectorAll(
-          'a, button, input, select, textarea, [role="button"], [role="tab"], ' +
-            '[class*="tab"], [class*="Tab"], [onclick]',
-        );
-        let idx = 0;
-        for (const el of Array.from(nodes)) {
-          if (idx >= maxElements) break;
-          const htmlEl = el as HTMLElement;
-          const rect = htmlEl.getBoundingClientRect();
-          const visible = rect.width > 0 && rect.height > 0;
-          if (!visible) continue;
-
-          const text = (htmlEl.innerText ?? htmlEl.textContent ?? '').replace(/\s+/g, ' ').trim();
-          const inputType =
-            htmlEl instanceof HTMLInputElement ? htmlEl.type : htmlEl.tagName.toLowerCase();
-
-          out.push({
-            ref: '', // 由外层填充
-            tag: htmlEl.tagName.toLowerCase(),
-            text: text.slice(0, 80),
-            placeholder: (htmlEl as HTMLInputElement).placeholder?.slice(0, 60) ?? '',
-            aria_label: htmlEl.getAttribute('aria-label')?.slice(0, 80) ?? '',
-            input_type: inputType,
-            visible,
-          });
-          idx += 1;
-        }
-
-        // 2. 启发式岗位卡片：找同时含岗位信号词的容器。
         const signals = ['工作地点', '招聘范围', '岗位职责', '岗位类别', 'Base地', '工作城市', '招聘人数', '发布日期'];
         const all = Array.from(document.querySelectorAll('*'));
         const seen = new Set<string>();
@@ -102,7 +130,6 @@ export async function takeSnapshot(page: Page): Promise<{
           if (t.length < 20 || t.length > 600) continue;
           const hitCount = signals.filter((s) => t.includes(s)).length;
           if (hitCount < 1) continue;
-          // 避免把祖先容器重复计入：只保留文本最短的一层。
           const key = t.slice(0, 50);
           if (seen.has(key)) continue;
           seen.add(key);
@@ -110,27 +137,21 @@ export async function takeSnapshot(page: Page): Promise<{
         }
 
         const bodyText = (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim();
-        return { elements: out, cards, bodyText: bodyText.slice(0, arg.textLimit) };
+        return { cards, bodyText: bodyText.slice(0, arg.textLimit) };
       },
       {
-        maxElements: MAX_ELEMENTS,
         maxCards: MAX_CARD_SAMPLES,
         cardLimit: CARD_SAMPLE_LIMIT,
         textLimit: TEXT_SAMPLE_LIMIT,
       },
     )
-    .catch(() => ({ elements: [] as SnapshotElement[], cards: [] as string[], bodyText: '' }));
-
-  // 在外层填充 ref，避免在页面上下文中生成序号（保持 evaluate 纯粹）。
-  const elements = data.elements.map((el, i) => ({
-    ...el,
-    ref: makeRef('el', i),
-  }));
+    .catch(() => ({ cards: [] as string[], bodyText: '' }));
 
   return {
     title,
     currentUrl,
     elements,
+    refs,
     textSample: redact(data.bodyText),
     cardSamples: data.cards.map((c) => redact(c)),
   };

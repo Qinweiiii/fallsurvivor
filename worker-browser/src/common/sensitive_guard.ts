@@ -81,11 +81,50 @@ export function looksLikeSubmit(text: string | undefined | null): boolean {
   return SUBMIT_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-/** 用于日志输出的脱敏函数：抹掉证件号、卡号、Bearer、Cookie。 */
+/**
+ * 判断一串数字是否可能是真实银行卡号（Luhn 校验）。
+ *
+ * 为什么需要它：早先的卡号规则是「13-19 位连续数字」，会把站点自己的
+ * 业务 ID 一并抹掉。实测快手 recruitSubProjectCodes=20271779425607
+ * 被替换成 [REDACTED_CARD]，而这个 ID 正是拼详情页 URL 的关键——
+ * 过度脱敏直接破坏了采集能力。
+ *
+ * Luhn 是所有主流卡组织的强制校验规则，随机业务 ID 通过它的概率约 1/10。
+ * 用它做二次确认，能在几乎不牺牲安全性的前提下大幅降低误伤。
+ */
+function looksLikeCardNumber(digits: string): boolean {
+  const n = digits.length;
+  if (n < 13 || n > 19) return false;
+
+  let sum = 0;
+  let double = false;
+  for (let i = n - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48;
+    if (double) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+/**
+ * 用于日志与对外输出的脱敏函数：抹掉证件号、卡号、Bearer、Cookie。
+ *
+ * 卡号采用「格式匹配 + Luhn 校验」两步判定，避免把业务 ID 当卡号抹掉。
+ * 证件号（18 位身份证 / 15 位旧证）保持严格抹除——
+ * 它的格式特征足够明确，误伤风险低，且泄漏后果更严重。
+ */
 export function redact(text: string): string {
   return text
     .replace(/\b\d{17}[\dXx]\b|\b\d{15}\b/g, '[REDACTED_ID]')
-    .replace(/\b(?:\d[ -]?){12,18}\d\b/g, '[REDACTED_CARD]')
+    .replace(/\b(?:\d[ -]?){12,18}\d\b/g, (match) => {
+      // 去掉分隔符后再校验；只有真正通过 Luhn 的才视为卡号。
+      const digits = match.replace(/[ -]/g, '');
+      return looksLikeCardNumber(digits) ? '[REDACTED_CARD]' : match;
+    })
     .replace(/bearer\s+[A-Za-z0-9._-]+/gi, '[REDACTED_TOKEN]')
     .replace(/(cookie|set-cookie|session[_-]?id)\s*[:=]\s*[^\s;,]+/gi, '[REDACTED_COOKIE]');
 }

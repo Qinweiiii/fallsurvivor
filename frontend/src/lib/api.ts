@@ -8,8 +8,11 @@
 import type {
   ApiEnvelope,
   JobDetail,
+  SiteCrawlRequest,
+  SiteCrawlResult,
   SiteRecipe,
   SiteRecipeRun,
+  SiteRecipeVerifyResult,
 } from './types';
 
 const BASE_URL =
@@ -130,6 +133,7 @@ export const jobsApi = {
   scrape: (id: string) => api.post<ScrapeResult>('/jobs/' + id + '/scrape'),
   scrapeResume: (id: string, taskId: string) =>
     api.post<ScrapeResult>('/jobs/' + id + '/scrape/resume', { task_id: taskId }),
+  crawl: (body: SiteCrawlRequest) => api.post<SiteCrawlResult>('/jobs/crawl', body),
 };
 
 /** 站点 Recipe 配置管理接口封装。 */
@@ -139,6 +143,12 @@ export const siteRecipesApi = {
   update: (id: string, body: Partial<SiteRecipe>) => api.put<SiteRecipe>(`/site-recipes/${id}`, body),
   remove: (id: string) => api.del<{ deleted: boolean }>(`/site-recipes/${id}`),
   runs: (id: string) => api.get<{ runs: SiteRecipeRun[]; count: number }>(`/site-recipes/${id}/runs`),
+  /**
+   * 用真实请求验证该配置能否采到岗位（仅 api 策略）。
+   * 结果会写回健康度，因此调用后应刷新列表。
+   */
+  verify: (id: string, keyword?: string) =>
+    api.post<SiteRecipeVerifyResult>(`/site-recipes/${id}/verify`, { keyword: keyword ?? '' }),
 };
 
 /** JD 补全结果。 */

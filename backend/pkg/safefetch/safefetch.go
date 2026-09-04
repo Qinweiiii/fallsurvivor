@@ -11,24 +11,28 @@
 package safefetch
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // 限制常量。
 const (
-	maxRedirects    = 3
-	maxBodyBytes    = 4 << 20 // 4 MiB
-	defaultTimeout  = 20 * time.Second
-	dialTimeout     = 5 * time.Second
+	maxRedirects     = 3
+	maxBodyBytes     = 4 << 20 // 4 MiB
+	defaultTimeout   = 20 * time.Second
+	dialTimeout      = 5 * time.Second
 	handshakeTimeout = 8 * time.Second
+	maxExtraHeaders  = 12
 )
 
 // 错误定义。
@@ -180,8 +184,70 @@ type Result struct {
 	Body        []byte
 }
 
+/**
+ * sensitiveHeaderPattern 匹配凭证类请求头名。
+ *
+ * 调用方可以传入额外请求头（站点 Recipe 沉淀的渠道 / 语言等语义头），
+ * 但本包会**无条件拒绝**凭证类头部。理由：
+ *   1. 出网抓取不应携带任何身份凭证——一旦目标站点被劫持或发生重定向，
+ *      凭证就会泄漏给第三方；
+ *   2. 需要登录态才能读的接口应走浏览器会话，而不是脱离会话直连。
+ * 这是纵深防御的最后一道：上游各层已过滤，此处再拦一次。
+ */
+var sensitiveHeaderPattern = regexp.MustCompile(
+	`(?i)(cookie|auth|token|secret|password|session|csrf|signature|sign|credential|key)`)
+
+// 保留头：这些由本包自己设置，不允许调用方覆盖，
+// 否则可能被用来伪造 Host 或破坏请求体解析。
+var reservedHeaders = map[string]bool{
+	"host":              true,
+	"content-length":    true,
+	"transfer-encoding": true,
+	"connection":        true,
+	"upgrade":           true,
+}
+
+/**
+ * applyExtraHeaders 把调用方提供的额外请求头写入请求。
+ *
+ * 过滤规则（任一命中即丢弃该头）：
+ *   - 命中凭证类关键词；
+ *   - 属于协议保留头；
+ *   - 名或值为空、值过长（>200，多半是编码凭证或指纹）；
+ *   - 含控制字符或换行（防 header 注入）。
+ *
+ * 最多接受 maxExtraHeaders 个，避免请求头被塞爆。
+ */
+func applyExtraHeaders(req *http.Request, extra map[string]string) {
+	if len(extra) == 0 {
+		return
+	}
+	applied := 0
+	for k, v := range extra {
+		name := strings.ToLower(strings.TrimSpace(k))
+		val := strings.TrimSpace(v)
+		if name == "" || val == "" || len(val) > 200 {
+			continue
+		}
+		if sensitiveHeaderPattern.MatchString(name) || reservedHeaders[name] {
+			continue
+		}
+		// Header 注入防护：名与值都不允许出现换行或控制字符。
+		if strings.ContainsAny(name, "\r\n:") || strings.ContainsAny(val, "\r\n") {
+			continue
+		}
+		req.Header.Set(name, val)
+		applied++
+		if applied >= maxExtraHeaders {
+			return
+		}
+	}
+}
+
 // Get 抓取指定 URL。每一跳重定向都会重新走完整校验流程。
-func (c *Client) Get(ctx context.Context, rawURL string) (*Result, error) {
+//
+// headers 为可选的额外请求头（可为 nil）。凭证类头部会被本包无条件丢弃。
+func (c *Client) Get(ctx context.Context, rawURL string, headers map[string]string) (*Result, error) {
 	if !c.enabled {
 		return nil, ErrDisabled
 	}
@@ -196,7 +262,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Result, error) {
 			return nil, err
 		}
 
-		res, location, err := c.doOnce(ctx, u, ips)
+		res, location, err := c.doOnceWithBody(ctx, u, ips, nil, nil, headers)
 		if err != nil {
 			return nil, err
 		}
@@ -214,9 +280,124 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Result, error) {
 	return nil, ErrTooManyRedirects
 }
 
-// doOnce 执行单次请求，把已校验的 IP 固定用于拨号。
+// PostJSON 以 application/json 提交请求体。
+//
+// 与 Get / PostForm 一样逐跳做 SSRF 校验与 IP 固定，不自动跟随重定向。
+//
+// body 的来源：站点 Recipe 中由 Exploration Agent 从**真实观测请求**沉淀的
+// 请求体，而非运行时用户输入拼接。执行器只负责原样复现，
+// 因此本包只校验其为合法 JSON，不再解析内容。
+//
+// body 为 nil 或空时发送 "{}"，避免接口因缺少对象而报错。
+// 重定向时按标准语义降级为 GET，不把请求体带到新地址。
+func (c *Client) PostJSON(ctx context.Context, rawURL string, body []byte, headers map[string]string) (*Result, error) {
+	if !c.enabled {
+		return nil, ErrDisabled
+	}
+	payload := bytes.TrimSpace(body)
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	// 提前校验合法性，避免把畸形 JSON 发到网络。
+	if !json.Valid(payload) {
+		return nil, fmt.Errorf("safefetch: POST 请求体不是合法 JSON")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	current := rawURL
+	for hop := 0; hop <= maxRedirects; hop++ {
+		u, ips, err := c.Validate(ctx, current)
+		if err != nil {
+			return nil, err
+		}
+
+		// 仅首跳携带请求体；重定向后降级为 GET。
+		var hopBody []byte
+		if hop == 0 {
+			hopBody = payload
+		}
+		res, location, err := c.doOnceWithBody(ctx, u, ips, url.Values{}, hopBody, headers)
+		if err != nil {
+			return nil, err
+		}
+		if location == "" {
+			return res, nil
+		}
+
+		next, err := u.Parse(location)
+		if err != nil {
+			return nil, fmt.Errorf("safefetch: 重定向地址非法: %w", err)
+		}
+		current = next.String()
+	}
+	return nil, ErrTooManyRedirects
+}
+
+// PostForm 以 application/x-www-form-urlencoded 提交表单。
+//
+// 与 Get 一样逐跳做 SSRF 校验与 IP 固定，不自动跟随重定向。
+//
+// form 的键必须来自调用方白名单（如站点 Recipe 沉淀的请求体字段），
+// 本函数不做参数过滤——调用方负责保证键名可信。
+// 值会经 url.Values.Encode 转义，不会破坏请求结构。
+//
+// 注意：重定向时按标准做法改为 GET（303/302 语义），
+// 不把表单体带到新地址，避免把数据泄漏到跳转目标。
+func (c *Client) PostForm(ctx context.Context, rawURL string, form url.Values, headers map[string]string) (*Result, error) {
+	if !c.enabled {
+		return nil, ErrDisabled
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	current := rawURL
+	for hop := 0; hop <= maxRedirects; hop++ {
+		u, ips, err := c.Validate(ctx, current)
+		if err != nil {
+			return nil, err
+		}
+
+		// 仅首跳携带表单；重定向后降级为 GET。
+		var body url.Values
+		if hop == 0 {
+			body = form
+		}
+		res, location, err := c.doOnceWithBody(ctx, u, ips, body, nil, headers)
+		if err != nil {
+			return nil, err
+		}
+		if location == "" {
+			return res, nil
+		}
+
+		next, err := u.Parse(location)
+		if err != nil {
+			return nil, fmt.Errorf("safefetch: 重定向地址非法: %w", err)
+		}
+		current = next.String()
+	}
+	return nil, ErrTooManyRedirects
+}
+
+// doOnceWithBody 执行单次请求，把已校验的 IP 固定用于拨号。
+//   - jsonBody 非空 → POST + application/json（优先级最高）；
+//   - 否则 form 非空 → POST + application/x-www-form-urlencoded；
+//   - 否则 → GET。
+//
+// extraHeaders 中的凭证类与保留头会被丢弃（见 applyExtraHeaders）。
+//
 // 若响应为 3xx，则通过 location 返回跳转目标而不自动跟随。
-func (c *Client) doOnce(ctx context.Context, u *url.URL, ips []net.IP) (*Result, string, error) {
+func (c *Client) doOnceWithBody(
+	ctx context.Context,
+	u *url.URL,
+	ips []net.IP,
+	form url.Values,
+	jsonBody []byte,
+	extraHeaders map[string]string,
+) (*Result, string, error) {
 	port := u.Port()
 	if port == "" {
 		if strings.EqualFold(u.Scheme, "https") {
@@ -259,13 +440,34 @@ func (c *Client) doOnce(ctx context.Context, u *url.URL, ips []net.IP) (*Result,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	// 优先级：jsonBody > form > GET。
+	var reqBody io.Reader
+	method := http.MethodGet
+	contentType := ""
+	switch {
+	case len(jsonBody) > 0:
+		method = http.MethodPost
+		contentType = "application/json"
+		reqBody = bytes.NewReader(jsonBody)
+	case len(form) > 0:
+		method = http.MethodPost
+		contentType = "application/x-www-form-urlencoded"
+		reqBody = strings.NewReader(form.Encode())
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), reqBody)
 	if err != nil {
 		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "JobHuntOS/1.0 (personal job-search assistant)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	// 调用方的额外头先应用，Content-Type 随后覆盖——
+	// 请求体类型由本包按实际 body 决定，不允许被外部头改写。
+	applyExtraHeaders(req, extraHeaders)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

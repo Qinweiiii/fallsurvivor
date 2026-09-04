@@ -300,12 +300,14 @@ func FuseScores(rule RuleScoreDetail, llm *ai.MatchResult) model.MatchAnalysis {
 	if llm == nil {
 		out.Score = rule.Total
 		out.LLMScore = 0
+		out.Reasons = dedupStrings(out.Reasons, 6)
+		out.Risks = dedupStrings(out.Risks, 4)
 		return out
 	}
 
 	out.LLMScore = llm.Score
 	out.Analyzer = "rule+llm"
-	out.Summary = llm.Summary
+	out.Summary = sanitizeAnalysisText(llm.Summary)
 	// LLM 的理由更贴近语义，放在前面。
 	out.Reasons = dedupStrings(append(append([]string{}, llm.Reasons...), rule.Reasons...), 6)
 	out.Risks = dedupStrings(append(append([]string{}, llm.Risks...), rule.Risks...), 4)
@@ -327,7 +329,7 @@ func dedupStrings(in []string, limit int) []string {
 	seen := make(map[string]bool, len(in))
 	out := make([]string, 0, limit)
 	for _, s := range in {
-		t := strings.TrimSpace(s)
+		t := sanitizeAnalysisText(s)
 		if t == "" {
 			continue
 		}
@@ -342,4 +344,38 @@ func dedupStrings(in []string, limit int) []string {
 		}
 	}
 	return out
+}
+
+func sanitizeAnalysisText(s string) string {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return ""
+	}
+	if endsWithAnalysisPlaceholderValue(t) {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"<nil>", "",
+		"<Nil>", "",
+		"<NULL>", "",
+		" nil ", " ",
+		" null ", " ",
+		" undefined ", " ",
+	)
+	t = replacer.Replace(t)
+	t = strings.TrimSpace(t)
+	t = strings.TrimRight(t, "：:，,、；;。 .")
+	return strings.TrimSpace(t)
+}
+
+func endsWithAnalysisPlaceholderValue(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	for _, placeholder := range []string{"<nil>", "nil", "null", "undefined"} {
+		for _, sep := range []string{"：", ":"} {
+			if strings.HasSuffix(lower, sep+placeholder) {
+				return true
+			}
+		}
+	}
+	return false
 }

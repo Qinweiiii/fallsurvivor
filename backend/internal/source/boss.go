@@ -41,14 +41,7 @@ func (s *BossSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, error
 		return nil, fmt.Errorf("boss: 底层搜索能力不可用")
 	}
 
-	// 在原检索式上追加站点限定。
-	queries := make([]string, 0, len(q.Queries))
-	for _, base := range q.Queries {
-		queries = append(queries, base+" site:zhipin.com")
-		if len(queries) >= 8 {
-			break
-		}
-	}
+	queries := buildBossQueries(q)
 	if len(queries) == 0 {
 		return nil, nil
 	}
@@ -56,6 +49,7 @@ func (s *BossSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, error
 	raws, err := s.backend.Search(ctx, SearchQuery{
 		Queries:            queries,
 		Locations:          q.Locations,
+		CompanyPreferences: q.CompanyPreferences,
 		GraduationYear:     q.GraduationYear,
 		MaxResultsPerQuery: 8,
 	})
@@ -74,6 +68,40 @@ func (s *BossSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, error
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func buildBossQueries(q SearchQuery) []string {
+	unknownCompanies := unknownOfficialCompanies(q.CompanyPreferences, DefaultCompanyAdapters)
+	hasSpecific := len(specificCompanyPrefs(q.CompanyPreferences)) > 0
+	hasBroad := hasBroadCompanyPref(q.CompanyPreferences)
+
+	queries := make([]string, 0, 8)
+	if len(unknownCompanies) > 0 {
+		for _, company := range unknownCompanies {
+			for _, base := range q.Queries {
+				queries = append(queries, company+" "+base+" site:zhipin.com")
+				if len(queries) >= 8 {
+					return queries
+				}
+			}
+		}
+		return queries
+	}
+
+	if hasSpecific && !hasBroad {
+		return nil
+	}
+
+	for _, base := range q.Queries {
+		queries = append(queries, base+" site:zhipin.com")
+		if len(queries) >= 8 {
+			break
+		}
+	}
+	if len(queries) == 0 {
+		return nil
+	}
+	return queries
 }
 
 // isBossHost 判断是否为 BOSS 直聘域名。

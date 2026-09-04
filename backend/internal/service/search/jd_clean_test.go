@@ -2,9 +2,25 @@ package search
 
 import (
 	"testing"
+	"time"
 
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
+	"github.com/eddiel/fallsurvivor/backend/internal/source"
 )
+
+func TestOfficialListOnlyCandidateNeedsNoJDOrDetailURL(t *testing.T) {
+	candidate := Candidate{Raw: source.RawJob{
+		SourceType:  model.SourceOfficial,
+		IdentityURL: "https://example.com/api/jobs#job_id=42",
+		Title:       "算法工程师",
+	}}
+	if !isOfficialListOnlyCandidate(candidate, true, "") {
+		t.Fatal("expected official list item with stable identity to be accepted without JD")
+	}
+	if isOfficialListOnlyCandidate(candidate, true, "岗位职责：负责模型训练") {
+		t.Fatal("candidate with JD must use the normal detail path")
+	}
+}
 
 func TestCleanJDText(t *testing.T) {
 	cases := []struct {
@@ -95,9 +111,91 @@ func TestApplySourceMetaSkipsEmpty(t *testing.T) {
 	if j.Department != "原有部门" {
 		t.Errorf("空 Meta 不应覆盖原值，实际 %q", j.Department)
 	}
+	applySourceMeta(j, map[string]string{"Department": "<nil>", "Business": "null"})
+	if j.Department != "原有部门" {
+		t.Errorf("<nil> Meta 不应覆盖原值，实际 %q", j.Department)
+	}
+	if j.Business != "" {
+		t.Errorf("null Meta 不应写入 Business，实际 %q", j.Business)
+	}
 	// nil map 不应 panic。
 	applySourceMeta(j, nil)
 	if j.Department != "原有部门" {
 		t.Errorf("nil Meta 不应改动值，实际 %q", j.Department)
+	}
+}
+
+func TestExistingJobRefreshFieldsUsesSourceMeta(t *testing.T) {
+	existing := &model.Job{
+		Department:  "旧部门",
+		Business:    "<nil>",
+		Location:    "",
+		DescQuality: string(DescQualityFull),
+		Description: "已有完整 JD",
+	}
+	publishedAt := time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC)
+	fields := existingJobRefreshFields(existing, source.RawJob{
+		URL:         "https://jobs.example.com/detail?id=1",
+		SourceType:  model.SourceOfficial,
+		PublishedAt: &publishedAt,
+		Meta: map[string]string{
+			"Department": "新部门",
+			"Business":   "新业务",
+			"Location":   "北京市-海淀区",
+			"Unused":     "ignored",
+		},
+		Content: "新内容不应覆盖已有 full JD。岗位职责：负责系统研发。岗位要求：熟悉 Go。",
+	})
+
+	if fields["department"] != "新部门" {
+		t.Fatalf("department = %#v, want 新部门", fields["department"])
+	}
+	if fields["business"] != "新业务" {
+		t.Fatalf("business = %#v, want 新业务", fields["business"])
+	}
+	if fields["location"] != "北京" {
+		t.Fatalf("location = %#v, want 北京", fields["location"])
+	}
+	if _, ok := fields["description"]; ok {
+		t.Fatalf("已有 full JD 时不应刷新 description")
+	}
+	if _, ok := fields["Unused"]; ok {
+		t.Fatalf("不应透传未知字段")
+	}
+	if got := fields["published_at"]; got != &publishedAt {
+		t.Fatalf("published_at = %#v, want original pointer", got)
+	}
+}
+
+func TestExistingJobRefreshFieldsSkipsNilPlaceholders(t *testing.T) {
+	existing := &model.Job{}
+	fields := existingJobRefreshFields(existing, source.RawJob{
+		SourceType: model.SourceOfficial,
+		Meta: map[string]string{
+			"Department": "<nil>",
+			"Business":   "null",
+			"Location":   "undefined",
+		},
+	})
+	if _, ok := fields["department"]; ok {
+		t.Fatalf("<nil> department 不应写入")
+	}
+	if _, ok := fields["business"]; ok {
+		t.Fatalf("null business 不应写入")
+	}
+	if _, ok := fields["location"]; ok {
+		t.Fatalf("undefined location 不应写入")
+	}
+}
+
+func TestShouldRefreshDescription(t *testing.T) {
+	if shouldRefreshDescription(&model.Job{Description: "完整 JD", DescQuality: string(DescQualityFull)}) {
+		t.Fatalf("full JD 不应刷新")
+	}
+	if !shouldRefreshDescription(&model.Job{Description: "", DescQuality: string(DescQualityFull)}) {
+		t.Fatalf("空 description 应刷新")
+	}
+	if !shouldRefreshDescription(&model.Job{Description: "摘要", DescQuality: string(DescQualitySnippet)}) {
+		t.Fatalf("snippet JD 应刷新")
 	}
 }

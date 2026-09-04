@@ -10,7 +10,11 @@
 // 在 Worker 持久会话中自行完成登录。
 package site
 
-import "time"
+import (
+	"time"
+
+	"github.com/eddiel/fallsurvivor/backend/internal/model"
+)
 
 // Strategy 采集策略类型。
 type Strategy string
@@ -19,8 +23,11 @@ const (
 	// StrategyBrowser 浏览器抽取：复用 Worker 的站点 adapter（腾讯、字节）。
 	// 适用于 SPA / 需登录 / 列表走异步接口 的站点。
 	StrategyBrowser Strategy = "browser"
-	// StrategyAPI 直接调用公开 HTTP 接口（当前保留扩展位，暂用于描述，不在第一版实现）。
+	// StrategyAPI 直接调用公开 HTTP 接口。当前支持 GET 列表接口。
 	StrategyAPI Strategy = "api"
+	// StrategyBrowserObserved 通过保存的页面动作触发站点自身请求，并直接解析
+	// 本次浏览器观测到的响应。它不重放脱离页面生命周期的 HTTP 请求。
+	StrategyBrowserObserved Strategy = "browser_observed"
 	// StrategyURLTemplate 按岗位 ID 模板拼详情页 URL（当前保留扩展位）。
 	StrategyURLTemplate Strategy = "url_template"
 )
@@ -37,6 +44,33 @@ const (
 	SourceExploration Source = "exploration"
 )
 
+// VerifyStatus 标记 Recipe 的验证状态，是 Agent 自愈闭环的状态机。
+//
+// 流转规则：
+//
+//	unverified --(探索后独立试跑成功)--> verified
+//	verified   --(连续失败达阈值)-----> invalid
+//	invalid    --(重新探索并验证通过)--> verified
+//
+// 只有 verified 的 Recipe 才值得信赖；invalid 会在下次命中时触发重新探索，
+// 而不是一直用一条已经失效的配置反复失败。
+type VerifyStatus string
+
+const (
+	// VerifyUnverified 尚未经过独立试跑验证。
+	VerifyUnverified VerifyStatus = "unverified"
+	// VerifyVerified 已用真实请求验证能采到岗位。
+	VerifyVerified VerifyStatus = "verified"
+	// VerifyInvalid 连续失败，判定已失效，需重新探索。
+	VerifyInvalid VerifyStatus = "invalid"
+)
+
+// MaxConsecutiveFailures 连续失败达到该次数即把 Recipe 标记为失效。
+//
+// 取 3 而不是 1：单次失败常见于网络抖动或站点临时限流，
+// 立刻判失效会导致频繁重探（探索成本远高于重试）。
+const MaxConsecutiveFailures = 3
+
 // Recipe 描述「某个招聘站点怎么采集」。
 type Recipe struct {
 	ID          string `json:"id"        gorm:"column:id;primaryKey;type:uuid;default:gen_random_uuid()"`
@@ -49,6 +83,54 @@ type Recipe struct {
 	// AdapterKey 仅 browser 策略使用，对应 Worker 侧 site adapter 的 key
 	// （见 worker-browser/src/sites/adapters.ts 的 adapter 表）。
 	AdapterKey string `json:"adapter_key" gorm:"column:adapter_key;type:text;not null;default:''"`
+
+	// API / url_template 策略使用。由 Exploration Agent 从网络请求中沉淀，
+	// 使已探索过的站点下次可以直接复用接口与字段映射。
+	ListAPI           string        `json:"list_api" gorm:"column:list_api;type:text;not null;default:''"`
+	DetailAPI         string        `json:"detail_api" gorm:"column:detail_api;type:text;not null;default:''"`
+	DetailURLTemplate string        `json:"detail_url_template" gorm:"column:detail_url_template;type:text;not null;default:''"`
+	Method            string        `json:"method" gorm:"column:method;type:varchar(10);not null;default:'GET'"`
+	IDField           string        `json:"id_field" gorm:"column:id_field;type:text;not null;default:''"`
+	TitleField        string        `json:"title_field" gorm:"column:title_field;type:text;not null;default:''"`
+	ListPath          string        `json:"list_path" gorm:"column:list_path;type:text;not null;default:''"`
+	KeywordParam      string        `json:"keyword_param" gorm:"column:keyword_param;type:text;not null;default:''"`
+	FieldMap          model.JSONMap `json:"field_map" gorm:"column:field_map;type:jsonb;serializer:json"`
+
+	// ---- 请求侧配置：让「怎么发这个请求」成为数据，而不是 Go 里的站点分支 ----
+	//
+	// 这三个字段由 Exploration Agent 从**真实观测到的请求**中沉淀。
+	// 有了它们，执行器只需原样复现，不必再猜「这个站点是要 JSON 还是 form」。
+	//
+	// RequestBody 仅 POST 时使用，内容是探索时观测到的请求体原文。
+	RequestBody string `json:"request_body" gorm:"column:request_body;type:text;not null;default:''"`
+	// RequestContentType 请求体类型（application/json 或
+	// application/x-www-form-urlencoded）。留空时按 JSON 处理。
+	RequestContentType string `json:"request_content_type" gorm:"column:request_content_type;type:text;not null;default:''"`
+	// RequestHeaders 复现接口所需的非凭证请求头（渠道 / 语言等）。
+	// 写入前经应用层白名单过滤，绝不含 Cookie / Authorization。
+	RequestHeaders model.JSONMap `json:"request_headers" gorm:"column:request_headers;type:jsonb;serializer:json"`
+	// BrowserPlan 是浏览器观测策略的可复用动作计划。
+	// 只保存跨会话稳定的语义动作（例如 navigate / search / 文案 click），
+	// 不保存一次会话内的 DOM ref。
+	BrowserPlan model.JSONMap `json:"browser_plan" gorm:"column:browser_plan;type:jsonb;serializer:json"`
+
+	// ---- 健康度：驱动「验证通过才保存」与「失效自动重探」----
+	//
+	// VerifyStatus 与 ConsecutiveFailures 同样【刻意不写】default tag，
+	// 原因与下方 Enabled 一致：零值（0 次失败）有业务含义，必须能写进去。
+	VerifyStatus VerifyStatus `json:"verify_status" gorm:"column:verify_status;type:varchar(20);not null"`
+	// VerifiedAt 最近一次验证通过的时间。
+	VerifiedAt *time.Time `json:"verified_at" gorm:"column:verified_at"`
+	// VerifiedJobs 验证时实际采到的岗位数，用于判断配置质量。
+	VerifiedJobs int `json:"verified_jobs" gorm:"column:verified_jobs;not null"`
+	// ConsecutiveFailures 连续失败次数；成功一次即归零。
+	ConsecutiveFailures int `json:"consecutive_failures" gorm:"column:consecutive_failures;not null"`
+	// LastError 最近一次失败原因，供自修正时喂回模型。
+	LastError string `json:"last_error" gorm:"column:last_error;type:text;not null;default:''"`
+
+	// KeywordInBody 关键词是否放在请求体里（POST 搜索接口常见）。
+	// 同样不带 default tag：false 是合法业务值。
+	KeywordInBody bool `json:"keyword_in_body" gorm:"column:keyword_in_body;not null"`
 
 	// 注意：以下三个字段【刻意不写】 gorm 的 default tag。
 	//

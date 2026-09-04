@@ -108,6 +108,43 @@ export function scoreTone(score: number): 'high' | 'good' | 'mid' | 'low' {
 
 /** 显示值，空则返回占位符。 */
 export function orDash(v: string | null | undefined): string {
-  const t = (v ?? '').trim();
+  const t = cleanDisplayValue(v);
   return t === '' ? '——' : t;
+}
+
+export function cleanDisplayValue(v: string | null | undefined): string {
+  const t = (v ?? '').trim();
+  return ['', '<nil>', 'nil', 'null', 'undefined'].includes(t.toLowerCase()) ? '' : t;
+}
+
+export function firstDisplayValue(...values: Array<string | null | undefined>): string {
+  for (const v of values) {
+    const t = cleanDisplayValue(v);
+    if (t) return t;
+  }
+  return '';
+}
+
+export function cleanDisplayText(v: string | null | undefined): string {
+  const t = cleanDisplayValue(v);
+  if (!t) return '';
+  if (/[：:]\s*(<nil>|nil|null|undefined)\s*$/i.test(t)) return '';
+  return t
+    .replace(/\s*(<nil>|nil|null|undefined)\s*/gi, ' ')
+    .replace(/[：:，,、；;。.\s]+$/g, '')
+    .trim();
+}
+
+export function cleanDisplayList(values: Array<string | null | undefined> | null | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of values ?? []) {
+    const cleaned = cleanDisplayText(v);
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+  }
+  return out;
 }

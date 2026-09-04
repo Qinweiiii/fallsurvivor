@@ -4,7 +4,7 @@ import { Badge, jobStatusToneOf } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { MatchBadge } from './MatchBadge';
 import { EmptyState, TableSkeleton } from '@/components/ui/States';
-import { cn, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
+import { cn, firstDisplayValue, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
 import type { Job } from '@/lib/types';
 
 interface JobTableProps {
@@ -94,10 +94,10 @@ export function JobTable({
                 <td
                   className={cn(
                     'td text-ink-600',
-                    (job.department || job.business || '').includes('|') && 'td-preline',
+                    firstDisplayValue(job.department, job.business).includes('|') && 'td-preline',
                   )}
                 >
-                  {renderDeptOrBusiness(job.department || job.business)}
+                  {renderDeptOrBusiness(firstDisplayValue(job.department, job.business))}
                 </td>
 
                 <td className="td">
@@ -152,7 +152,7 @@ export function JobTable({
  * 含「|」时按分隔符换行展示，其余沿用 orDash：空值显示「-」。
  */
 function renderDeptOrBusiness(value: string | null | undefined): string {
-  if (!value || !value.trim()) return '-';
+  if (!value || !value.trim()) return '——';
   if (value.includes('|')) {
     return value.split('|').map((s) => s.trim()).filter(Boolean).join('\n');
   }

@@ -40,6 +40,36 @@ func TestDedupInBatchKeepsDifferentURLJobs(t *testing.T) {
 	}
 }
 
+func TestDedupInBatchKeepsDifferentIdentityURLJobs(t *testing.T) {
+	raws := []source.RawJob{
+		{
+			IdentityURL:  "https://join.qq.com/api/v1/position/searchPosition#job_id=199907820022",
+			URL:          "https://join.qq.com/post.html?query=p_1&keyword=ai",
+			Title:        "AI应用工程师",
+			SourceType:   model.SourceOfficial,
+			CompanyHint:  "腾讯",
+			LocationHint: "深圳",
+		},
+		{
+			IdentityURL:  "https://join.qq.com/api/v1/position/searchPosition#job_id=199907820023",
+			URL:          "https://join.qq.com/post.html?query=p_1&keyword=ai",
+			Title:        "AI应用工程师",
+			SourceType:   model.SourceOfficial,
+			CompanyHint:  "腾讯",
+			LocationHint: "深圳",
+		},
+	}
+
+	candidates, _, stats := DedupInBatch(raws)
+
+	if len(candidates) != 2 {
+		t.Fatalf("IdentityURL 不同的岗位应各自保留为 2 条，实际 %d 条", len(candidates))
+	}
+	if stats.MergedInBatch != 0 {
+		t.Fatalf("IdentityURL 不同的岗位不应批内合并，实际合并 %d 条", stats.MergedInBatch)
+	}
+}
+
 func TestDedupInBatchPrefersOfficialSource(t *testing.T) {
 	// 仅当 normalized_url 完全相同（去掉追踪参数后一致）时才合并，
 	// 且保留来源优先级更高的记录（OFFICIAL > 其他）。

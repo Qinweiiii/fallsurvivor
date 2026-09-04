@@ -108,7 +108,7 @@ export default function SettingsPage() {
                     offHint="未配置 DEEPSEEK_API_KEY，将使用纯规则评分"
                   />
                   <StatusLine
-                    label="岗位搜索（Tavily）"
+                    label="岗位搜索（定向发现）"
                     ok={health.search_ready}
                     offHint="未配置 TAVILY_API_KEY，无法在线获取岗位"
                   />

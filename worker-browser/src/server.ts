@@ -4,9 +4,9 @@
  * 安全边界：
  *   1. 只监听 127.0.0.1，不对外暴露；
  *   2. 所有请求需携带与后端一致的 X-Worker-Token；
- *   3. 只提供四类能力：打开页面、读取表单结构、填写指定字段、读取当前页面正文（仅 innerText，只读）；
+ *   3. 提供打开页面、读取表单结构、填写指定字段、读取正文与探索导航能力；
  *   4. 不提供执行任意选择器 / JS 的接口；
- *   5. 不存在任何点击提交按钮的代码路径；抓取 JD 亦不会触发任何导航或点击。
+ *   5. 表单填写接口不点击最终提交；探索导航只执行后端明确下发的单步动作。
  */
 
 import http from 'node:http';
@@ -17,6 +17,7 @@ import {
   closeSession,
   closeAll,
   startIdleReaper,
+  setExploreRefs,
 } from './common/browser_manager.js';
 import { extractFields, detectBlocked, countSensitive } from './common/field_extractor.js';
 import { fillFields, highlightSubmitArea } from './common/field_filler.js';
@@ -24,16 +25,22 @@ import { getAdapter, type SiteAdapter } from './sites/adapters.js';
 import type { Page } from 'playwright';
 import { performNavAction } from './common/nav_act.js';
 import { takeSnapshot } from './common/explore_act.js';
+import { serializeDOM } from './common/dom_serializer.js';
 import { getNetworkObserver } from './common/browser_manager.js';
 import { rankRequests } from './common/network_ranker.js';
+import type { ObservedRequest } from './common/network_observer.js';
 import { redact } from './common/sensitive_guard.js';
 import type {
   ExtractResponse,
   ExtractJobsResponse,
   FillRequest,
   FillResponse,
+  MarkdownResponse,
   NavActRequest,
   NavActResponse,
+  NetworkRecord,
+  InspectRequestRequest,
+  InspectRequestResponse,
   ObserveDiffRequest,
   ObserveDiffResponse,
   ObserveStartResponse,
@@ -108,7 +115,13 @@ const LOGIN_WAIT_MAX_MS = 20_000;
 const LOGIN_WAIT_INTERVAL_MS = 1_000;
 
 /**
- * 轮询等待页面渲染出实质内容后再判定登录态。
+ * 页面刚完成 domcontentloaded 后仍可能被站点脚本重定向到认证页。
+ * 连续可访问且 URL 不变超过该窗口，才允许会话进入后续抓取步骤。
+ */
+const LOGIN_READY_STABLE_MS = 5_000;
+
+/**
+ * 轮询等待页面渲染出实质内容后再判定是否可继续访问。
  *
  * 为什么需要等待：
  *   openSession 只保证 domcontentloaded，SPA 正文要等 JS 执行完才出现。
@@ -126,24 +139,31 @@ const LOGIN_WAIT_INTERVAL_MS = 1_000;
  */
 async function waitForLoginState(page: Page, adapter: SiteAdapter): Promise<boolean> {
   const started = Date.now();
-
-  // 先立即判定一次：已登录态或同步渲染的页面可以马上放行。
-  if (await adapter.isLoggedIn(page).catch(() => false)) {
-    return true;
-  }
+  let readySince = 0;
+  let readyURL = '';
 
   while (Date.now() - started < LOGIN_WAIT_MAX_MS) {
-    await page.waitForTimeout(LOGIN_WAIT_INTERVAL_MS).catch(() => undefined);
-    if (await adapter.isLoggedIn(page).catch(() => false)) {
-      console.log(`[session/open] 等待 ${Date.now() - started}ms 后判定为可继续`);
-      return true;
+    const currentURL = page.url();
+    const ready = await adapter.isLoggedIn(page).catch(() => false);
+    if (ready) {
+      if (readyURL !== currentURL) {
+        readyURL = currentURL;
+        readySince = Date.now();
+      }
+      if (Date.now() - readySince >= LOGIN_READY_STABLE_MS) {
+        console.log(`[session/open] 等待 ${Date.now() - started}ms 后判定为可继续访问`);
+        return true;
+      }
+    } else {
+      readySince = 0;
+      readyURL = '';
     }
+    await page.waitForTimeout(LOGIN_WAIT_INTERVAL_MS).catch(() => undefined);
   }
 
-  console.log(`[session/open] 等待 ${Date.now() - started}ms 仍未渲染出内容，判定为需要登录`);
+  console.log(`[session/open] 等待 ${Date.now() - started}ms 后页面不可继续访问`);
   return false;
 }
-
 /** 校验字符串型 task_id。 */
 function requireTaskId(body: unknown): string {
   const obj = body as { task_id?: unknown };
@@ -166,14 +186,14 @@ async function handleOpenSession(body: unknown): Promise<OpenSessionResponse> {
   const session = await openSession(taskId, siteKey, url);
   const adapter = getAdapter(session.siteKey);
 
-  // 登录态判定必须等页面渲染出内容才有意义。
+  // 访问状态判定必须等页面渲染出内容才有意义。
   //
   // 早期版本在 goto(domcontentloaded) 之后立即判定，此时 SPA 还没渲染，
   // 正文长度往往不足，导致【公开可访问的岗位详情页】（如字节 campus/position/xxx/detail）
   // 被误判为 needs_login，进而中断流程——用户甚至来不及登录就被关闭了会话。
   // 这里先等待渲染，首次判定未通过时再等一轮重试，兼顾慢站点与真实登录墙。
   const loggedIn = await waitForLoginState(session.page, adapter);
-  session.step = loggedIn ? 'logged_in' : 'login_required';
+  session.step = loggedIn ? 'accessible' : 'login_required';
 
   return {
     task_id: taskId,
@@ -182,7 +202,7 @@ async function handleOpenSession(body: unknown): Promise<OpenSessionResponse> {
     current_url: session.page.url(),
     step: session.step,
     message: loggedIn
-      ? '已复用登录态'
+      ? '页面可继续访问'
       : '请在浏览器中完成登录与验证，完成后回到系统点击继续',
   };
 }
@@ -303,8 +323,8 @@ async function handleClose(body: unknown): Promise<{ closed: boolean }> {
  * POST /nav/act
  *
  * 执行后端 AI 决策出的单步导航动作（点击 / 滚动 / 导航 / 等待）。
- * 安全约束全部在 performNavAction 内部强制：不执行任意 JS、禁止点击提交按钮、
- * navigate 仅允许 http/https 公网地址。最终投递动作仍由用户亲自完成。
+ * 安全约束全部在 performNavAction 内部强制：不执行任意 JS，
+ * click_ref 只使用当前探索快照元素，navigate 仅允许 http/https 公网地址。
  */
 async function handleNavAct(body: unknown): Promise<NavActResponse> {
   const taskId = requireTaskId(body);
@@ -313,7 +333,7 @@ async function handleNavAct(body: unknown): Promise<NavActResponse> {
   if (!session || session.page.isClosed()) {
     throw new Error('会话不存在或浏览器已关闭');
   }
-  const outcome = await performNavAction(session.page, req.action ?? {});
+  const outcome = await performNavAction(session, req.action ?? {});
   session.step = 'navigating';
   return {
     task_id: taskId,
@@ -441,6 +461,56 @@ async function handleObserveStart(body: unknown): Promise<ObserveStartResponse> 
 }
 
 /**
+ * 把内部观测记录转为对外契约（字段名对齐 Go 侧 DTO）。
+ *
+ * 抽成函数是为了保证 new_requests 与 candidates 两处映射永不漂移——
+ * 之前两处各写一遍，加请求侧字段时极易漏掉一处，导致 Agent 拿不到请求体。
+ */
+function toNetworkRecord(r: ObservedRequest): NetworkRecord {
+  return {
+    seq: r.seq,
+    method: r.method,
+    url: r.url,
+    status: r.status,
+    content_type: r.contentType,
+    size: r.size,
+    sample: r.sample,
+    full_sample: r.fullSample,
+    schema_summary: r.schemaSummary,
+    request_body: r.requestBody,
+    request_content_type: r.requestContentType,
+    request_headers: r.requestHeaders,
+    at: r.at,
+  };
+}
+
+/**
+ * POST /explore/inspect-request
+ *
+ * 按网络请求 seq 返回更大的脱敏响应片段。
+ * 这是只读动作，用于 LLM 在 schema/sample 不够清晰时进一步确认字段层级。
+ */
+async function handleInspectRequest(body: unknown): Promise<InspectRequestResponse> {
+  const taskId = requireTaskId(body);
+  const req = body as InspectRequestRequest;
+  const session = getSession(taskId);
+  if (!session || session.page.isClosed()) {
+    throw new Error('会话不存在或浏览器已关闭');
+  }
+  const seq = typeof req.seq === 'number' ? req.seq : 0;
+  if (!Number.isInteger(seq) || seq <= 0) {
+    throw new Error('seq 必须是正整数');
+  }
+  const obs = getNetworkObserver(session);
+  const record = obs.findBySeq(seq);
+  return {
+    task_id: taskId,
+    current_url: session.page.url(),
+    record: record ? toNetworkRecord(record) : null,
+  };
+}
+
+/**
  * POST /explore/observe-diff
  *
  * 返回自 since 以来新增的网络请求，并给出规则打分后的候选。
@@ -463,30 +533,11 @@ async function handleObserveDiff(body: unknown): Promise<ObserveDiffResponse> {
   const recent = obs.since(since);
   const sliced = recent.length > limit ? recent.slice(recent.length - limit) : recent;
 
-  // 转为对外契约（字段名对齐 Go 侧 DTO）。
-  const newRequests = sliced.map((r) => ({
-    seq: r.seq,
-    method: r.method,
-    url: r.url,
-    status: r.status,
-    content_type: r.contentType,
-    size: r.size,
-    sample: r.sample,
-    at: r.at,
-  }));
+  const newRequests = sliced.map(toNetworkRecord);
 
   // 规则打分：只把高价值候选交给 LLM，省 token 也提高注意力。
   const ranked = rankRequests(sliced, topN).map((r) => ({
-    record: {
-      seq: r.request.seq,
-      method: r.request.method,
-      url: r.request.url,
-      status: r.request.status,
-      content_type: r.request.contentType,
-      size: r.request.size,
-      sample: r.request.sample,
-      at: r.request.at,
-    },
+    record: toNetworkRecord(r.request),
     score: r.score,
     reasons: r.reasons,
   }));
@@ -517,6 +568,7 @@ async function handleSnapshot(body: unknown): Promise<SnapshotResponse> {
     throw new Error('会话不存在或浏览器已关闭');
   }
   const snap = await takeSnapshot(session.page);
+  await setExploreRefs(session, snap.refs);
   session.step = 'snapshot';
   return {
     task_id: taskId,
@@ -525,6 +577,35 @@ async function handleSnapshot(body: unknown): Promise<SnapshotResponse> {
     elements: snap.elements,
     text_sample: snap.textSample,
     card_samples: snap.cardSamples,
+  };
+}
+
+/**
+ * POST /page/markdown
+ *
+ * 把渲染后的页面正文转成 Markdown 交给调用方（供 LLM 结构化抽取）。
+ *
+ * 与 /page/extract-jobs 的区别：
+ *   extract-jobs 依赖站点适配器里写好的选择器，只覆盖已适配站点；
+ *   本接口不含任何站点知识，对任意站点通用——
+ *   代价是需要下游 LLM 阅读，换来的是「新站点不必写代码」。
+ *
+ * 只读操作：不点击、不执行站点脚本。
+ */
+async function handleMarkdown(body: unknown): Promise<MarkdownResponse> {
+  const taskId = requireTaskId(body);
+  const session = getSession(taskId);
+  if (!session || session.page.isClosed()) {
+    throw new Error('会话不存在或浏览器已关闭');
+  }
+  const res = await serializeDOM(session.page);
+  session.step = 'markdown';
+  return {
+    task_id: taskId,
+    current_url: res.currentUrl,
+    title: res.title,
+    markdown: res.markdown,
+    truncated: res.truncated,
   };
 }
 
@@ -538,10 +619,13 @@ const routes: Record<string, (body: unknown) => Promise<unknown>> = {
   '/form/highlight-submit': handleHighlight,
   '/page/scrape': handleScrape,
   '/page/extract-jobs': handleExtractJobs,
+  // 通用抽取：读渲染后的正文，不依赖任何站点适配器。
+  '/page/markdown': handleMarkdown,
   '/nav/act': handleNavAct,
   // 探索能力：只读，供 Exploration Agent 感知页面与网络。
   '/explore/observe-start': handleObserveStart,
   '/explore/observe-diff': handleObserveDiff,
+  '/explore/inspect-request': handleInspectRequest,
   '/explore/snapshot': handleSnapshot,
 };
 
@@ -602,7 +686,7 @@ server.listen(PORT, HOST, () => {
   if (!TOKEN) {
     console.warn('[worker] 未设置 BROWSER_WORKER_TOKEN，仅可用于本机开发环境');
   }
-  console.log('[worker] 提示：本 Worker 不会点击任何提交按钮，最终提交须由你亲自完成');
+  console.log('[worker] 提示：表单填写接口不会点击最终提交；探索导航会执行后端下发的单步点击/搜索/跳转');
 });
 
 /** 优雅退出：关闭全部浏览器会话。 */

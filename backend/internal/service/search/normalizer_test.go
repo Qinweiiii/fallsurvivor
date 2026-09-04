@@ -10,6 +10,7 @@ func TestNormalizeURL(t *testing.T) {
 	}{
 		{"去掉追踪参数", "https://jobs.example.com/p/123?utm_source=wx&id=9", "https://jobs.example.com/p/123?id=9"},
 		{"去掉 www 与 fragment", "https://WWW.Example.com/Job/1#apply", "https://example.com/Job/1"},
+		{"保留岗位身份 fragment", "https://example.com/api/jobs#job_id=123", "https://example.com/api/jobs#job_id=123"},
 		{"去掉默认端口与尾斜杠", "https://example.com:443/job/1/", "https://example.com/job/1"},
 		{"参数排序稳定", "https://example.com/j?b=2&a=1", "https://example.com/j?a=1&b=2"},
 		{"非法输入返回空", "not a url", ""},

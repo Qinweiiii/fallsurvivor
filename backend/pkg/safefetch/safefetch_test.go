@@ -4,22 +4,23 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"testing"
 )
 
 func TestIsBlockedIP(t *testing.T) {
 	blocked := []string{
-		"127.0.0.1",      // 回环
-		"0.0.0.0",        // 未指定
-		"10.1.2.3",       // 私有
-		"172.16.0.1",     // 私有
-		"192.168.1.1",    // 私有
+		"127.0.0.1",       // 回环
+		"0.0.0.0",         // 未指定
+		"10.1.2.3",        // 私有
+		"172.16.0.1",      // 私有
+		"192.168.1.1",     // 私有
 		"169.254.169.254", // 云元数据服务
-		"100.64.0.1",     // CGNAT
-		"224.0.0.1",      // 组播
-		"::1",            // IPv6 回环
-		"fe80::1",        // IPv6 链路本地
-		"fc00::1",        // IPv6 唯一本地
+		"100.64.0.1",      // CGNAT
+		"224.0.0.1",       // 组播
+		"::1",             // IPv6 回环
+		"fe80::1",         // IPv6 链路本地
+		"fc00::1",         // IPv6 唯一本地
 	}
 	for _, s := range blocked {
 		if !isBlockedIP(net.ParseIP(s)) {
@@ -100,7 +101,39 @@ func TestValidateRejectsInternalLiteralIP(t *testing.T) {
 
 func TestDisabledClientRejectsAll(t *testing.T) {
 	c := New(false)
-	if _, err := c.Get(context.Background(), "https://example.com"); !errors.Is(err, ErrDisabled) {
+	if _, err := c.Get(context.Background(), "https://example.com", nil); !errors.Is(err, ErrDisabled) {
 		t.Errorf("关闭出网时应拒绝所有请求，实际错误: %v", err)
+	}
+}
+
+func TestApplyExtraHeadersKeepsBrowserContextButDropsCredentials(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://example.com/jobs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyExtraHeaders(req, map[string]string{
+		"Origin":            "https://example.com",
+		"Referer":           "https://example.com/campus",
+		"User-Agent":        "Mozilla/5.0",
+		"Sec-Fetch-Site":    "same-origin",
+		"X-Requested-With":  "XMLHttpRequest",
+		"Cookie":            "sid=secret",
+		"Authorization":     "Bearer secret",
+		"X-CSRF-Token":      "secret",
+		"Host":              "evil.example",
+		"X-Injected-Header": "bad\nvalue",
+	})
+
+	for _, name := range []string{"Origin", "Referer", "User-Agent", "Sec-Fetch-Site", "X-Requested-With"} {
+		if req.Header.Get(name) == "" {
+			t.Fatalf("expected %s to be preserved", name)
+		}
+	}
+
+	for _, name := range []string{"Cookie", "Authorization", "X-CSRF-Token", "Host", "X-Injected-Header"} {
+		if req.Header.Get(name) != "" {
+			t.Fatalf("expected %s to be dropped, got %q", name, req.Header.Get(name))
+		}
 	}
 }

@@ -10,52 +10,46 @@ import (
 
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
 	"github.com/eddiel/fallsurvivor/backend/internal/browser"
+	"github.com/eddiel/fallsurvivor/backend/internal/executor"
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
 	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/eddiel/fallsurvivor/backend/internal/source"
 )
 
-// SiteCrawler 负责在已登录的招聘站点上做多步导航，
-// 一步步发现「具体岗位详情页」的入口（标题 / URL / 部门）。
+// SiteCrawler 负责按站点 Recipe 或浏览器动作采集岗位列表。
+// 主目标是先拿到经过关键词筛选的岗位列表；详情页正文与原网页 URL
+// 属于后置补全，不应阻塞列表岗位入库。
 //
-// 导航策略：
-//   - 优先使用站点级半固定脚本（如腾讯），省 LLM token；
-//   - 无固定策略时回退到 AI 逐步决策导航。
+// 导航策略：已知站点走 Recipe Fast Path；未知站点统一交给 Explorer。
 //
 // 安全与资源约束：
 //   - 复用 Worker 的持久登录态（按 siteKey），不处理密码；
-//   - 每步导航动作由 Worker 端做安全校验（禁提交按钮、navigate 仅公网地址）；
+//   - 每步导航动作由 Worker 端做安全校验（不执行任意 JS，navigate 仅公网地址）；
 //   - 限制最大步数与最大发现岗位数，防止死循环与 token 失控；
-//   - 若页面需要登录，立即返回错误交由用户在浏览器中先登录。
+//   - 若页面出现真实登录墙/验证页，交由用户在浏览器中先处理。
 type SiteCrawler struct {
 	browser *browser.Client
 	llm     *ai.Client
 }
 
-// NewSiteCrawler 构造爬虫。browser 或 llm 为 nil 时 Crawl 会直接返回不可用错误。
+// NewSiteCrawler 构造爬虫。
 func NewSiteCrawler(b *browser.Client, llm *ai.Client) *SiteCrawler {
 	return &SiteCrawler{browser: b, llm: llm}
 }
 
-const (
-	crawlMaxSteps = 18
-	crawlMaxJobs  = 24
-)
-
 // Crawl 从 startURL 开始多步导航，返回发现的岗位入口。
 // taskID 用于复用 Worker 会话（同一 taskID 复用已打开的浏览器窗口与登录态）。
-// strategy 可选："auto"（按站点路由，默认）、"script"（强制半固定）、"ai"（强制 AI）。
+// strategy 可选："auto"（默认）、"script"（仅保留给腾讯旧脚本调试）。
 //
-// 策略路由：auto 模式下有半固定脚本的站点（如 tencent）走固定步骤，其余走 AI 导航。
+// 未知站点的多步探索由 Explorer 负责。这里不再保留另一套基于全文抓取的
+// AI 导航器，否则同一个请求会因 strategy 不同走出两套不可比较的行为。
 func (c *SiteCrawler) Crawl(ctx context.Context, taskID, siteKey, startURL, strategy string) ([]ai.NavJob, error) {
-	// 强制 AI 模式（用于调试 / 沉淀真实路径）。
-	if strategy == "ai" {
-		slog.Info("强制 AI 导航模式", "task_id", taskID, "site", siteKey)
-		return c.crawlAI(ctx, taskID, siteKey, startURL)
-	}
-
-	// 强制脚本模式 / 站点级策略路由：腾讯走半固定脚本（校招浏览器抽卡）。
-	if strategy == "script" || siteKey == "tencent" {
+	// 旧腾讯脚本不再按 siteKey 自动触发；只有显式调试参数才可调用，
+	// 正常请求统一经 Explorer / Recipe。
+	if strategy == "script" {
+		if siteKey != "tencent" {
+			return nil, fmt.Errorf("script 策略当前仅保留给腾讯旧链路调试")
+		}
 		slog.Info("使用腾讯半固定导航策略", "task_id", taskID)
 		_, raws, err := c.CrawlTencent(ctx, taskID, startURL, "")
 		if err != nil {
@@ -69,8 +63,7 @@ func (c *SiteCrawler) Crawl(ctx context.Context, taskID, siteKey, startURL, stra
 		return navJobs, nil
 	}
 
-	// 通用：AI 逐步导航。
-	return c.crawlAI(ctx, taskID, siteKey, startURL)
+	return nil, fmt.Errorf("未知站点必须通过 Exploration Agent 探索，请使用 strategy=explore")
 }
 
 // defaultMaxDetailFetches 是站点 Recipe 未配置 max_detail_fetches 时的兜底值，
@@ -217,14 +210,17 @@ func (c *SiteCrawler) CrawlWithRecipe(ctx context.Context, taskID string, rc *si
 	if rc == nil {
 		return nil, fmt.Errorf("crawl: Recipe 为空")
 	}
+	if rc.StrategyType == site.StrategyBrowserObserved {
+		return c.crawlBrowserObserved(ctx, taskID, rc, startURL, keyword)
+	}
 	// 站点标识：优先用 adapter_key（Worker 侧靠它选 adapter），回退到 site_key。
 	siteKey := strings.TrimSpace(rc.AdapterKey)
 	if siteKey == "" {
 		siteKey = rc.SiteKey
 	}
-	entry := strings.TrimSpace(startURL)
+	entry := strings.TrimSpace(rc.CampusURL)
 	if entry == "" {
-		entry = strings.TrimSpace(rc.CampusURL)
+		entry = strings.TrimSpace(startURL)
 	}
 	if entry == "" {
 		return nil, fmt.Errorf("crawl: 站点 %s 未配置采集入口 URL", rc.SiteKey)
@@ -251,6 +247,166 @@ func (c *SiteCrawler) CrawlWithRecipe(ctx context.Context, taskID string, rc *si
 	return raws, nil
 }
 
+// crawlBrowserObserved 执行保存的页面动作，并解析页面本次真实收到的列表响应。
+// 不会重新发起一条脱离页面生命周期的 HTTP 请求。
+func (c *SiteCrawler) crawlBrowserObserved(ctx context.Context, taskID string, rc *site.Recipe, startURL, keyword string) ([]source.RawJob, error) {
+	if c.browser == nil || !c.browser.Health(ctx) {
+		return nil, browser.ErrWorkerUnavailable
+	}
+	entry := strings.TrimSpace(rc.CampusURL)
+	if entry == "" {
+		entry = strings.TrimSpace(startURL)
+	}
+	if entry == "" {
+		return nil, fmt.Errorf("crawl: 站点 %s 未配置采集入口 URL", rc.SiteKey)
+	}
+
+	siteKey := strings.TrimSpace(rc.SiteKey)
+	if siteKey == "" {
+		siteKey = "generic"
+	}
+	if _, err := c.browser.OpenSession(ctx, browser.SessionRequest{
+		TaskID:  taskID,
+		SiteKey: siteKey,
+		URL:     entry,
+	}); err != nil {
+		return nil, fmt.Errorf("browser_observed: 打开会话失败: %w", err)
+	}
+	defer func() {
+		_ = c.browser.CloseSession(ctx, taskID)
+	}()
+
+	cursor, err := c.browser.ObserveStart(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("browser_observed: 启动网络观测失败: %w", err)
+	}
+	if err := c.runBrowserPlan(ctx, taskID, rc.BrowserPlan, keyword); err != nil {
+		return nil, err
+	}
+	time.Sleep(exploreWaitAfterAction * time.Second)
+	records, err := c.browser.ObserveDiffAll(ctx, taskID, cursor, 80)
+	if err != nil {
+		return nil, fmt.Errorf("browser_observed: 读取页面请求失败: %w", err)
+	}
+	for _, record := range records {
+		if record.Status < 200 || record.Status >= 300 || !sameAPIPath(rc.ListAPI, record.URL) {
+			continue
+		}
+		full, inspectErr := c.browser.InspectRequest(ctx, taskID, record.Seq)
+		if inspectErr != nil {
+			continue
+		}
+		body := firstNonEmpty(full.FullSample, full.Sample)
+		jobs, parseErr := executor.ParseAPIJobs(rc, full.URL, []byte(body))
+		if parseErr != nil || len(jobs) == 0 {
+			continue
+		}
+		if rc.MaxJobsPerSearch > 0 && len(jobs) > rc.MaxJobsPerSearch {
+			jobs = jobs[:rc.MaxJobsPerSearch]
+		}
+		c.enrichBrowserObservedDetails(ctx, taskID, rc, jobs)
+		slog.Info("browser_observed 使用页面真实响应解析岗位", "site_key", rc.SiteKey, "jobs", len(jobs))
+		return jobs, nil
+	}
+	return nil, fmt.Errorf("browser_observed: 页面动作后未观测到可解析的岗位列表响应")
+}
+
+// enrichBrowserObservedDetails 只访问已由 Recipe 的实测模板生成的同站详情页。
+// 单页失败不否定列表路径，保留列表结果并等待下次正常请求重新探索或更新 Recipe。
+func (c *SiteCrawler) enrichBrowserObservedDetails(ctx context.Context, taskID string, rc *site.Recipe, jobs []source.RawJob) {
+	if rc == nil || strings.TrimSpace(rc.DetailURLTemplate) == "" || rc.MaxDetailFetches <= 0 {
+		return
+	}
+	limit := rc.MaxDetailFetches
+	if limit > len(jobs) {
+		limit = len(jobs)
+	}
+	entryHost := hostOf(rc.CampusURL)
+	for i := 0; i < limit; i++ {
+		if jobs[i].URL == "" || (entryHost != "" && !strings.EqualFold(hostOf(jobs[i].URL), entryHost)) {
+			continue
+		}
+		resp, err := c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavNavigate, URL: jobs[i].URL})
+		if err != nil || !resp.OK {
+			continue
+		}
+		_, _ = c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: exploreWaitAfterAction})
+		page, err := c.browser.ScrapePage(ctx, taskID)
+		if err != nil || page == nil || page.NeedsLogin {
+			continue
+		}
+		content, quality := DetectDescriptionQuality(page.PageText)
+		if quality == DescQualityEmpty {
+			continue
+		}
+		jobs[i].Content = content
+		jobs[i].Snippet = truncateForLog(content, 500)
+	}
+}
+
+func sameAPIPath(a, b string) bool {
+	au, errA := url.Parse(strings.TrimSpace(a))
+	bu, errB := url.Parse(strings.TrimSpace(b))
+	if errA != nil || errB != nil || au.Host == "" || bu.Host == "" {
+		return strings.TrimSpace(a) == strings.TrimSpace(b)
+	}
+	return strings.EqualFold(au.Host, bu.Host) && au.Path == bu.Path
+}
+
+// runBrowserPlan 只执行可跨会话复用的语义动作。DOM ref 是单个页面实例的临时
+// 标识，保存它会让下次任务天然失效，因此这里刻意不支持。
+func (c *SiteCrawler) runBrowserPlan(ctx context.Context, taskID string, plan model.JSONMap, keyword string) error {
+	actions, _ := plan["actions"].([]any)
+	ranSearch := false
+	for _, raw := range actions {
+		action, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind := strings.TrimSpace(fmt.Sprint(action["type"]))
+		var nav browser.NavAction
+		switch kind {
+		case "navigate":
+			url := strings.TrimSpace(fmt.Sprint(action["url"]))
+			if url == "" {
+				continue
+			}
+			nav = browser.NavAction{Type: browser.NavNavigate, URL: url}
+		case "click":
+			text := strings.TrimSpace(fmt.Sprint(action["text"]))
+			if text == "" {
+				continue
+			}
+			nav = browser.NavAction{Type: browser.NavClick, Text: text}
+		case "search":
+			if strings.TrimSpace(keyword) == "" {
+				continue
+			}
+			nav = browser.NavAction{Type: browser.NavSearch, Keyword: keyword}
+			ranSearch = true
+		default:
+			continue
+		}
+		resp, err := c.browser.NavAct(ctx, taskID, nav)
+		if err != nil || !resp.OK {
+			if err != nil {
+				return fmt.Errorf("browser_observed: 动作 %s 失败: %w", kind, err)
+			}
+			return fmt.Errorf("browser_observed: 动作 %s 未完成: %s", kind, resp.Message)
+		}
+	}
+	if !ranSearch && strings.TrimSpace(keyword) != "" {
+		resp, err := c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavSearch, Keyword: keyword})
+		if err != nil || !resp.OK {
+			if err != nil {
+				return fmt.Errorf("browser_observed: 搜索失败: %w", err)
+			}
+			return fmt.Errorf("browser_observed: 搜索未完成: %s", resp.Message)
+		}
+	}
+	return nil
+}
+
 // cardToRawJob 把结构化卡片（含可选的 JD 正文）转换为待入库的原始岗位。
 // 公司名与部门（腾讯校招按部门展开，每条 JobCard 带 Department）以权威 Meta 写入，
 // pipeline 的 applySourceMeta 会优先采用并覆盖模型从长文本中的解析结果。
@@ -270,133 +426,7 @@ func cardToRawJob(card browser.JobCard, content, company, sourceName string) sou
 	}
 }
 
-// crawlAI 使用 LLM 逐步决策导航，适用于没有半固定脚本的通用站点。
-func (c *SiteCrawler) crawlAI(ctx context.Context, taskID, siteKey, startURL string) ([]ai.NavJob, error) {
-	if c.browser == nil || !c.browser.Health(ctx) {
-		return nil, browser.ErrWorkerUnavailable
-	}
-	if c.llm == nil || !c.llm.Enabled() {
-		return nil, fmt.Errorf("browser: LLM 未启用，无法驱动导航")
-	}
-
-	// 打开会话（复用 siteKey 对应的持久登录态）。
-	if _, err := c.browser.OpenSession(ctx, browser.SessionRequest{
-		TaskID:  taskID,
-		SiteKey: siteKey,
-		URL:     startURL,
-	}); err != nil {
-		return nil, fmt.Errorf("browser: 打开会话失败: %w", err)
-	}
-	defer func() {
-		_ = c.browser.CloseSession(ctx, taskID)
-	}()
-
-	startHost := hostOf(startURL)
-	jobs := make([]ai.NavJob, 0, crawlMaxJobs)
-	seen := make(map[string]bool)
-	history := make([]string, 0, crawlMaxSteps)
-	first := true
-
-	for step := 0; step < crawlMaxSteps; step++ {
-		if ctx.Err() != nil {
-			return jobs, nil
-		}
-
-		scrape, err := c.browser.ScrapePage(ctx, taskID)
-		if err != nil {
-			return jobs, fmt.Errorf("browser: 抓取页面失败: %w", err)
-		}
-		if scrape.NeedsLogin {
-			return jobs, fmt.Errorf("browser: 页面需要登录后才能继续，请在浏览器中完成登录后重试")
-		}
-
-		if !first {
-			if seen[scrape.CurrentURL] {
-				slog.Info("导航回到已访问页，停止", "url", scrape.CurrentURL)
-				break
-			}
-		}
-		seen[scrape.CurrentURL] = true
-		first = false
-
-		decision, err := c.llm.NavigateStep(ctx, ai.NavStepInput{
-			Site:     siteKey,
-			URL:      scrape.CurrentURL,
-			Title:    scrape.Title,
-			PageText: scrape.PageText,
-			History:  history,
-		})
-		if err != nil {
-			slog.Warn("导航决策失败，停止", "error", err.Error())
-			break
-		}
-
-		for _, j := range decision.Jobs {
-			if j.URL == "" || seen[j.URL] {
-				continue
-			}
-			if startHost != "" && hostOf(j.URL) != startHost {
-				continue
-			}
-			jobs = append(jobs, j)
-			seen[j.URL] = true
-			if len(jobs) >= crawlMaxJobs {
-				return jobs, nil
-			}
-		}
-
-		switch decision.Action.Type {
-		case ai.NavStop:
-			return jobs, nil
-		case ai.NavClick, ai.NavScroll, ai.NavNavigate, ai.NavWait:
-			navAct := browser.NavAction{
-				Type:      browser.NavActionType(decision.Action.Type),
-				Text:      decision.Action.Text,
-				Direction: decision.Action.Direction,
-				Amount:    decision.Action.Amount,
-				URL:       decision.Action.URL,
-				Seconds:   decision.Action.Seconds,
-			}
-			act, err := c.browser.NavAct(ctx, taskID, navAct)
-			if err != nil {
-				slog.Warn("导航动作执行失败，停止", "error", err.Error())
-				return jobs, err
-			}
-			if !act.OK {
-				slog.Warn("导航动作未成功", "msg", act.Message)
-			}
-		default:
-			return jobs, nil
-		}
-
-		history = append(history, fmt.Sprintf("第%d步 [%s] %s",
-			step+1, decision.Action.Type, actionDesc(decision.Action)))
-		select {
-		case <-ctx.Done():
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-
-	return jobs, nil
-}
-
-// actionDesc 把动作转成一段简短可读描述，用于历史记录。
-func actionDesc(a ai.NavAction) string {
-	switch a.Type {
-	case ai.NavClick:
-		return "click " + a.Text
-	case ai.NavScroll:
-		return "scroll " + a.Direction
-	case ai.NavNavigate:
-		return "navigate " + a.URL
-	case ai.NavWait:
-		return fmt.Sprintf("wait %ds", a.Seconds)
-	default:
-		return string(a.Type)
-	}
-}
-
-// hostOf 提取 URL 的 host（含端口），非法输入返回空串。
+// hostOf 仅用于可视化详情抓取时限制同站导航，和已移除的旧 AI 导航器无关。
 func hostOf(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {

@@ -125,7 +125,7 @@ export default function JobsPage() {
     setPage(1);
   }, [debouncedFilters]);
 
-  const jobs = data?.items ?? [];
+  const jobs = useMemo(() => data?.items ?? [], [data?.items]);
 
   const toggleOne = useCallback((id: string) => {
     setSelectedIds((prev) => {

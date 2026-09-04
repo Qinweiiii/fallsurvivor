@@ -5,8 +5,8 @@
 //     由 search.SiteCrawler 实现。这样避免了 executor ↔ search 的循环依赖，
 //     也让 Executor 可独立测试（注入 fake crawler）。
 //  2. 策略分派：按 Recipe.StrategyType 路由到具体实现。
-//     第一版只实现 browser 策略（复用 Worker adapter）；
-//     api / url_template 为预留扩展位，命中时返回明确错误而非静默失败。
+//     browser 复用 Worker adapter，api 复用探索沉淀出的 GET 列表接口；
+//     url_template 为预留扩展位，命中时返回明确错误而非静默失败。
 //  3. 执行留痕：每次执行都会记录一条 recipe_runs，
 //     既用于观测，也是后续 Reflection（Recipe 失效自愈）的输入。
 package executor
@@ -19,6 +19,7 @@ import (
 
 	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/eddiel/fallsurvivor/backend/internal/source"
+	"github.com/eddiel/fallsurvivor/backend/pkg/safefetch"
 )
 
 // Crawler 是底层采集能力的抽象，由 service/search.SiteCrawler 实现。
@@ -58,11 +59,12 @@ type Result struct {
 type Executor struct {
 	crawler Crawler
 	runs    *site.Repository
+	fetcher *safefetch.Client
 }
 
 // New 构造 Executor。runs 可为 nil（不记录执行历史）。
-func New(c Crawler, runs *site.Repository) *Executor {
-	return &Executor{crawler: c, runs: runs}
+func New(c Crawler, runs *site.Repository, fetcher *safefetch.Client) *Executor {
+	return &Executor{crawler: c, runs: runs, fetcher: fetcher}
 }
 
 // Execute 执行一条 Recipe。
@@ -102,20 +104,25 @@ func (e *Executor) executeByStrategy(ctx context.Context, p Params) ([]source.Ra
 	switch p.Recipe.StrategyType {
 	case site.StrategyBrowser:
 		return e.executeBrowser(ctx, p)
+	case site.StrategyBrowserObserved:
+		return e.executeBrowser(ctx, p)
 	case site.StrategyAPI:
-		// 预留：直接调用站点公开 HTTP 接口。
-		// 当前版本未实现——腾讯社招 API 走的是 source.TencentSource，
-		// 尚未抽象成 Recipe。命中时明确报错，避免静默返回空结果。
-		return nil, fmt.Errorf("策略 %q 尚未实现（当前仅支持 browser）", site.StrategyAPI)
+		return e.executeAPI(ctx, p)
 	case site.StrategyURLTemplate:
 		// 预留：按岗位 ID 模板拼详情页 URL。
-		return nil, fmt.Errorf("策略 %q 尚未实现（当前仅支持 browser）", site.StrategyURLTemplate)
+		return nil, fmt.Errorf("策略 %q 尚未实现（当前支持 browser / api GET）", site.StrategyURLTemplate)
 	default:
 		return nil, fmt.Errorf("未知策略类型 %q", p.Recipe.StrategyType)
 	}
 }
 
-// recordRun 把执行结果写入 recipe_runs。失败不影响主流程。
+// recordRun 把执行结果写入 recipe_runs，并同步更新 Recipe 健康度。
+//
+// 健康度更新是自愈闭环的前半段：连续失败达阈值时 Recipe 被标记为
+// invalid，Fast Path 下次命中它会主动跳过并重新探索。
+// 没有这一步，一条失效配置会一直静默失败到有人来看日志。
+//
+// 失败不影响主流程——观测能力不该拖垮采集本身。
 func (e *Executor) recordRun(ctx context.Context, rc *site.Recipe, keyword string, jobs []source.RawJob, runErr error, durationMS int64) {
 	if e.runs == nil {
 		return
@@ -142,5 +149,44 @@ func (e *Executor) recordRun(ctx context.Context, rc *site.Recipe, keyword strin
 	}
 	if err := e.runs.RecordRun(ctx, run); err != nil {
 		slog.Warn("记录 Recipe 执行历史失败", "site_key", rc.SiteKey, "error", err.Error())
+	}
+
+	e.updateHealth(ctx, rc, run)
+}
+
+/**
+ * updateHealth 按本次执行结果更新 Recipe 的健康度。
+ *
+ * 判定口径：
+ *   - success → 成功，计数归零并标记 verified；
+ *   - failed  → 失败，累加连续失败计数；
+ *   - empty   → 只记录执行历史，不更新健康度。
+ *
+ * 为什么 empty 不再算失败：空结果可能只是用户关键词当前没有岗位，
+ * 尤其是已验证过的 Recipe。真正的结构失效会在验证/探索阶段暴露为
+ * JSON 路径、字段或 HTTP 错误，而不是用一次空搜索污染站点健康度。
+ *
+ * 用 WithoutCancel：主流程的 ctx 可能在返回后立即取消，
+ * 健康度是后续自愈的依据，不该因此写不进去。
+ */
+func (e *Executor) updateHealth(ctx context.Context, rc *site.Recipe, run *site.Run) {
+	ctx = context.WithoutCancel(ctx)
+
+	if run.Status == site.RunSuccess {
+		if err := e.runs.MarkSuccess(ctx, rc.SiteKey, run.JobsFound); err != nil {
+			slog.Warn("更新 Recipe 健康度失败", "site_key", rc.SiteKey, "error", err.Error())
+		}
+		return
+	}
+	if run.Status == site.RunEmpty {
+		return
+	}
+
+	reason := run.ErrorMessage
+	if reason == "" {
+		reason = "执行成功但未采集到任何岗位，站点结构可能已变化"
+	}
+	if err := e.runs.MarkFailure(ctx, rc.SiteKey, reason); err != nil {
+		slog.Warn("更新 Recipe 健康度失败", "site_key", rc.SiteKey, "error", err.Error())
 	}
 }

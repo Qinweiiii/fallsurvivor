@@ -6,6 +6,7 @@ import useSWR from 'swr';
 import { fetcher } from '@/lib/api';
 import type { DashboardData } from '@/lib/types';
 import {
+  firstDisplayValue,
   formatDaysLeft,
   formatRelative,
   orDash,
@@ -228,7 +229,7 @@ function HighMatchCard({ data }: { data: DashboardData }) {
                   <p className="truncate text-sm font-medium text-ink-800">{job.title}</p>
                   <p className="mt-0.5 truncate text-xs text-ink-500">
                     {job.company_name}
-                    {job.department ? ` · ${job.department}` : ''}
+                    {firstDisplayValue(job.department) ? ` · ${firstDisplayValue(job.department)}` : ''}
                     {job.location ? ` · ${job.location}` : ''}
                   </p>
                 </div>

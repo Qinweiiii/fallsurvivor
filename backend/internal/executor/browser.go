@@ -23,8 +23,8 @@ func (e *Executor) executeBrowser(ctx context.Context, p Params) ([]source.RawJo
 	}
 	rc := p.Recipe
 
-	// adapter_key 为空时无法路由到 Worker 侧的站点适配器。
-	if rc.AdapterKey == "" {
+	// 传统 browser 策略依赖 Worker 侧站点 adapter；browser_observed 只需要浏览器上下文。
+	if rc.StrategyType == site.StrategyBrowser && rc.AdapterKey == "" {
 		return nil, fmt.Errorf("站点 %s 的 adapter_key 为空，无法执行浏览器采集", rc.SiteKey)
 	}
 
@@ -45,6 +45,7 @@ func (e *Executor) executeBrowser(ctx context.Context, p Params) ([]source.RawJo
 // 编译期断言：确保本包用到的 site 类型存在，避免误删。
 var (
 	_ = site.StrategyBrowser
+	_ = site.StrategyBrowserObserved
 	_ = site.SourcePreset
 	_ = site.RunSuccess
 	_ = (source.RawJob{}).SourceType

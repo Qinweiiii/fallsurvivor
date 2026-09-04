@@ -84,9 +84,11 @@ func run() error {
 		Handler:           engine,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      120 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// 探索新招聘站点会经过浏览器操作、网络观测、LLM 生成与验证；
+		// handler 自身用 5 分钟 context 控制上限，HTTP 写超时需要覆盖它。
+		WriteTimeout:   6 * time.Minute,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	// 容器内需要监听所有网卡才能被 compose 网络访问。
 	if os.Getenv("BIND_ALL") == "true" {

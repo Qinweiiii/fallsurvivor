@@ -1,6 +1,7 @@
 package search
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
@@ -122,6 +123,34 @@ func TestFuseScoresWithLLM(t *testing.T) {
 	}
 	if len(out.Risks) == 0 {
 		t.Error("风险项应被保留")
+	}
+}
+
+func TestFuseScoresSanitizesNilPlaceholders(t *testing.T) {
+	rule := RuleScoreDetail{
+		Total: 60,
+		Risks: []string{"工作地点不在偏好城市列表：<nil>"},
+	}
+	llm := &ai.MatchResult{
+		Score:   80,
+		Summary: "匹配较好 <nil>",
+		Risks:   []string{"工作地点不在偏好城市列表：<nil>", "缺少 CUDA 经验"},
+	}
+	out := FuseScores(rule, llm)
+
+	for _, risk := range out.Risks {
+		if strings.Contains(risk, "<nil>") {
+			t.Fatalf("risk 不应包含 <nil>: %q", risk)
+		}
+		if risk == "工作地点不在偏好城市列表" {
+			t.Fatalf("无具体值的风险项应被丢弃: %q", risk)
+		}
+	}
+	if len(out.Risks) != 1 || out.Risks[0] != "缺少 CUDA 经验" {
+		t.Fatalf("risks = %#v, want only 缺少 CUDA 经验", out.Risks)
+	}
+	if strings.Contains(out.Summary, "<nil>") {
+		t.Fatalf("summary 不应包含 <nil>: %q", out.Summary)
 	}
 }
 

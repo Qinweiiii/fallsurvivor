@@ -8,7 +8,14 @@ import { Badge } from '@/components/ui/Badge';
 import { MatchBadge } from './MatchBadge';
 import { ErrorState, Skeleton } from '@/components/ui/States';
 import { fetcher, jobsApi } from '@/lib/api';
-import { formatDate, orDash, SOURCE_LABELS } from '@/lib/utils';
+import {
+  cleanDisplayList,
+  cleanDisplayText,
+  firstDisplayValue,
+  formatDate,
+  orDash,
+  SOURCE_LABELS,
+} from '@/lib/utils';
 import type { JobDetail } from '@/lib/types';
 
 interface JobDrawerProps {
@@ -30,6 +37,9 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
   const [scrapeMsg, setScrapeMsg] = useState<string | null>(null);
 
   const analysis = data?.match_analysis ?? {};
+  const analysisSummary = cleanDisplayText(analysis.summary);
+  const analysisReasons = cleanDisplayList(analysis.reasons);
+  const analysisRisks = cleanDisplayList(analysis.risks);
 
   // 用已登录浏览器抓取真实 JD。若需登录则保留 task_id 等待用户登录后继续。
   async function handleScrape() {
@@ -78,7 +88,11 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
       open={Boolean(jobId)}
       onClose={onClose}
       title={data?.title ?? '岗位详情'}
-      subtitle={data ? `${data.company_name}${data.department ? ` · ${data.department}` : ''}` : undefined}
+      subtitle={
+        data
+          ? `${data.company_name}${firstDisplayValue(data.department) ? ` · ${firstDisplayValue(data.department)}` : ''}`
+          : undefined
+      }
       footer={
         data ? (
           <div className="flex items-center justify-between gap-3">
@@ -165,7 +179,7 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
           <Section title="基础信息">
             <dl className="grid grid-cols-2 gap-x-6 gap-y-3">
               <Field label="公司" value={orDash(data.company_name)} />
-              <Field label="部门 / 业务" value={orDash(data.department || data.business)} />
+              <Field label="部门 / 业务" value={orDash(firstDisplayValue(data.department, data.business))} />
               <Field label="岗位" value={orDash(data.title)} />
               <Field
                 label="工作地点"
@@ -199,13 +213,13 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
             title="AI 匹配分析"
             extra={<MatchBadge score={data.match_score} />}
           >
-            {analysis.summary ? (
-              <p className="mb-3 text-sm text-ink-700">{analysis.summary}</p>
+            {analysisSummary ? (
+              <p className="mb-3 text-sm text-ink-700">{analysisSummary}</p>
             ) : null}
 
-            {(analysis.reasons?.length ?? 0) > 0 ? (
+            {analysisReasons.length > 0 ? (
               <ul className="space-y-1.5">
-                {analysis.reasons?.map((r, i) => (
+                {analysisReasons.map((r, i) => (
                   <li key={i} className="flex gap-2 text-sm text-ink-700">
                     <span className="mt-0.5 text-mint-500">✓</span>
                     <span>{r}</span>
@@ -216,11 +230,11 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
               <p className="text-sm text-ink-400">暂无匹配分析</p>
             )}
 
-            {(analysis.risks?.length ?? 0) > 0 ? (
+            {analysisRisks.length > 0 ? (
               <>
                 <p className="mb-1.5 mt-4 text-xs font-medium text-ink-500">需要注意</p>
                 <ul className="space-y-1.5">
-                  {analysis.risks?.map((r, i) => (
+                  {analysisRisks.map((r, i) => (
                     <li key={i} className="flex gap-2 text-sm text-ink-700">
                       <span className="mt-0.5 text-cream-500">△</span>
                       <span>{r}</span>

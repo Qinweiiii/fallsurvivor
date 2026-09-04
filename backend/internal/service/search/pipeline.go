@@ -162,6 +162,7 @@ func (p *Pipeline) run(ctx context.Context, task *model.SearchTask) (*RunResult,
 	sq := source.SearchQuery{
 		Queries:            queries,
 		Locations:          profile.PreferredLocations,
+		CompanyPreferences: profile.CompanyPreferences,
 		GraduationYear:     profile.GraduationYear,
 		MaxResultsPerQuery: 2,
 	}
@@ -422,6 +423,7 @@ func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []so
 	resumeBrief := resumeProfile.Brief()
 
 	res.Total = len(candidates)
+	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxLLMConcurrency)
 	for i := range candidates {
@@ -432,6 +434,8 @@ func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []so
 				slog.Warn("处理岗位候选失败", "url", c.NormalizedURL, "error", err.Error())
 				return nil
 			}
+			mu.Lock()
+			defer mu.Unlock()
 			if created {
 				res.NewCount++
 			} else if reason == "duplicate" {
@@ -479,8 +483,14 @@ func (p *Pipeline) processCandidate(
 		}
 	}()
 	// ---- 跨批次去重：已按用户要求暂时停用 ----
-	// 主链路优先：先确保爬到的岗位都能入库显示，去重逻辑后续再补。
-	// 停用点：不再查库判重，每个候选都直接走完整解析+落库流程。
+	// 这里不做复杂的语义合并，只用确定性的 URL / 指纹判断「是否已经入库」。
+	// 命中后刷新来源与来源侧元数据并短路，避免重复爬取时先调用 LLM、最后再撞唯一索引。
+	if existing, found, err := p.findExistingCandidate(ctx, c); err != nil {
+		return false, 0, "dedup_lookup_failed", err
+	} else if found {
+		p.refreshExistingJob(ctx, existing, c)
+		return false, existing.MatchScore, "duplicate", nil
+	}
 
 	// ---- 获取更完整的页面文本 ----
 	pageText := CleanText(c.Raw.Content)
@@ -496,7 +506,8 @@ func (p *Pipeline) processCandidate(
 	// StripHTML 会把导航菜单、页脚等拆成独立行混入正文，
 	// 导致 JD 断行且夹杂「了解更多」这类无关文字。
 	pageText = CleanJDText(pageText)
-	if strings.TrimSpace(pageText) == "" {
+	listOnly := isOfficialListOnlyCandidate(c, trustSource, pageText)
+	if strings.TrimSpace(pageText) == "" && !listOnly {
 		// 完全没有可用文本，不虚构内容，直接跳过。
 		return false, 0, "empty_text", errors.New("候选缺少可用文本")
 	}
@@ -561,7 +572,7 @@ func (p *Pipeline) processCandidate(
 		job.OfficialURL = c.Raw.URL
 	}
 
-	if p.llm.Enabled() {
+	if p.llm.Enabled() && !listOnly && pageText != "" {
 		parsed, err := p.llm.ParseJD(ctx, pageText, c.Raw.URL, c.Title)
 		if err != nil {
 			slog.Warn("JD 解析失败，保留原始文本", "url", c.NormalizedURL, "error", err.Error())
@@ -577,14 +588,19 @@ func (p *Pipeline) processCandidate(
 
 	// 重新计算指纹（解析后公司名可能更准确）。
 	// 纳入 URLID：让不同 postid 的同名岗位拥有不同指纹。
-	// 注：去重查重已按用户要求停用，此处仅记录指纹，不做判重。
 	job.DedupFingerprint = URLIDFingerprint(job.CompanyName, job.Title, job.Location, ExtractURLJobID(c.NormalizedURL))
+	if existing, found, err := p.findExistingJob(ctx, job); err != nil {
+		return false, 0, "dedup_lookup_failed", err
+	} else if found {
+		p.refreshExistingJob(ctx, existing, c)
+		return false, existing.MatchScore, "duplicate", nil
+	}
 
 	// ---- 评分 ----
 	rule := ComputeRuleScore(ScoreInput{Job: job, Profile: profile, CityScores: cityScores})
 
 	var llmResult *ai.MatchResult
-	if p.llm.Enabled() {
+	if p.llm.Enabled() && !listOnly {
 		in := ai.MatchInput{
 			Job: ai.MatchJobBrief{
 				CompanyName:    job.CompanyName,
@@ -630,6 +646,18 @@ func (p *Pipeline) processCandidate(
 	// 表现为「明明爬到了、LLM 也分析了，但数据库里就是没有」。
 	// 现在统一以 Error 级别打印真实错误，便于定位。
 	if err := p.store.Job.Create(ctx, job); err != nil {
+		if isUniqueViolation(err) {
+			if existing, found, findErr := p.findExistingJob(ctx, job); findErr != nil {
+				slog.Error("岗位唯一索引冲突后查重失败",
+					"url", c.NormalizedURL,
+					"title", job.Title,
+					"company", job.CompanyName,
+					"error", findErr.Error())
+			} else if found {
+				p.refreshExistingJob(ctx, existing, c)
+				return false, existing.MatchScore, "duplicate", nil
+			}
+		}
 		slog.Error("岗位落库失败",
 			"url", c.NormalizedURL,
 			"title", job.Title,
@@ -643,6 +671,114 @@ func (p *Pipeline) processCandidate(
 	return true, job.MatchScore, "", nil
 }
 
+// isOfficialListOnlyCandidate 标记“已由站点列表接口确认存在，但详情尚未取得”的岗位。
+// IdentityURL 是列表接口加岗位稳定 ID 的内部身份，不会展示为用户可点击原网页。
+func isOfficialListOnlyCandidate(c Candidate, trustSource bool, pageText string) bool {
+	return trustSource &&
+		c.Raw.SourceType == model.SourceOfficial &&
+		strings.TrimSpace(c.Raw.URL) == "" &&
+		strings.TrimSpace(c.Raw.IdentityURL) != "" &&
+		strings.TrimSpace(pageText) == ""
+}
+
+func (p *Pipeline) findExistingCandidate(ctx context.Context, c Candidate) (*model.Job, bool, error) {
+	officialURL := ""
+	if c.Raw.SourceType == model.SourceOfficial {
+		officialURL = c.Raw.URL
+	}
+	existing, err := p.store.Job.FindDuplicate(ctx, officialURL, c.NormalizedURL, c.Fingerprint)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return existing, existing != nil, nil
+}
+
+func (p *Pipeline) findExistingJob(ctx context.Context, job *model.Job) (*model.Job, bool, error) {
+	if job == nil {
+		return nil, false, nil
+	}
+	existing, err := p.store.Job.FindDuplicate(ctx, job.OfficialURL, job.NormalizedURL, job.DedupFingerprint)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return existing, existing != nil, nil
+}
+
+func (p *Pipeline) refreshExistingJob(ctx context.Context, existing *model.Job, c Candidate) {
+	if existing == nil {
+		return
+	}
+	fields := existingJobRefreshFields(existing, c.Raw)
+	if len(fields) > 0 {
+		if err := p.store.Job.UpdateEnrichment(ctx, existing.ID, fields); err != nil {
+			slog.Warn("刷新已存在岗位字段失败",
+				"job_id", existing.ID.String(),
+				"url", c.NormalizedURL,
+				"error", err.Error())
+		}
+	}
+	p.upsertSource(ctx, existing.ID, c.Raw)
+}
+
+func existingJobRefreshFields(existing *model.Job, raw source.RawJob) map[string]any {
+	fields := map[string]any{"crawled_at": time.Now().UTC()}
+	if existing == nil {
+		return fields
+	}
+	if raw.SourceType == model.SourceOfficial && cleanJobScalar(raw.URL) != "" {
+		if cleanJobScalar(existing.SourceURL) == "" {
+			fields["source_url"] = raw.URL
+		}
+		if cleanJobScalar(existing.OfficialURL) == "" {
+			fields["official_url"] = raw.URL
+		}
+	}
+	if raw.PublishedAt != nil && existing.PublishedAt == nil {
+		fields["published_at"] = raw.PublishedAt
+	}
+	if v := cleanJobScalar(raw.Meta["Department"]); v != "" {
+		fields["department"] = v
+	}
+	if v := cleanJobScalar(raw.Meta["Business"]); v != "" {
+		fields["business"] = v
+	}
+	if v := cleanJobScalar(raw.Meta["Location"]); v != "" {
+		if city := NormalizeCity(v); city != "" {
+			fields["location"] = city
+			fields["locations"] = model.JSONStringArray{city}
+		}
+	}
+	if text := CleanJDText(CleanText(raw.Content)); text != "" && shouldRefreshDescription(existing) {
+		descText, descQuality := DetectDescriptionQuality(text)
+		if descQuality != DescQualityEmpty {
+			fields["description"] = TruncateRunes(descText, 20000)
+			fields["desc_quality"] = string(descQuality)
+		}
+	}
+	return fields
+}
+
+func shouldRefreshDescription(existing *model.Job) bool {
+	if existing == nil {
+		return false
+	}
+	return strings.TrimSpace(existing.Description) == "" || existing.DescQuality == "" || existing.DescQuality != string(DescQualityFull)
+}
+
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate key value") || strings.Contains(msg, "unique constraint")
+}
+
 // tryFetch 抓取页面正文。任何失败都静默降级，不影响任务。
 func (p *Pipeline) tryFetch(ctx context.Context, rawURL string) string {
 	if p.fetcher == nil {
@@ -651,7 +787,7 @@ func (p *Pipeline) tryFetch(ctx context.Context, rawURL string) string {
 	fetchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	res, err := p.fetcher.Get(fetchCtx, rawURL)
+	res, err := p.fetcher.Get(fetchCtx, rawURL, nil)
 	if err != nil {
 		slog.Debug("抓取页面失败", "error", err.Error())
 		return ""
@@ -707,16 +843,16 @@ func applySourceMeta(job *model.Job, meta map[string]string) {
 	if len(meta) == 0 || job == nil {
 		return
 	}
-	if v := strings.TrimSpace(meta["Company"]); v != "" {
+	if v := cleanJobScalar(meta["Company"]); v != "" {
 		job.CompanyName = v
 	}
-	if v := strings.TrimSpace(meta["Department"]); v != "" {
+	if v := cleanJobScalar(meta["Department"]); v != "" {
 		job.Department = v
 	}
-	if v := strings.TrimSpace(meta["Business"]); v != "" {
+	if v := cleanJobScalar(meta["Business"]); v != "" {
 		job.Business = v
 	}
-	if v := strings.TrimSpace(meta["Location"]); v != "" {
+	if v := cleanJobScalar(meta["Location"]); v != "" {
 		if city := NormalizeCity(v); city != "" {
 			job.Location = city
 			job.Locations = model.JSONStringArray{city}
@@ -728,17 +864,17 @@ func applyParsed(job *model.Job, parsed *ai.ParsedJob) {
 	if parsed == nil {
 		return
 	}
-	if parsed.CompanyName != "" {
-		job.CompanyName = parsed.CompanyName
+	if v := cleanJobScalar(parsed.CompanyName); v != "" {
+		job.CompanyName = v
 	}
-	if parsed.Title != "" {
-		job.Title = parsed.Title
+	if v := cleanJobScalar(parsed.Title); v != "" {
+		job.Title = v
 	}
-	if parsed.Department != "" {
-		job.Department = parsed.Department
+	if v := cleanJobScalar(parsed.Department); v != "" {
+		job.Department = v
 	}
-	if parsed.Business != "" {
-		job.Business = parsed.Business
+	if v := cleanJobScalar(parsed.Business); v != "" {
+		job.Business = v
 	}
 	if len(parsed.Locations) > 0 {
 		cities := make([]string, 0, len(parsed.Locations))
@@ -752,8 +888,8 @@ func applyParsed(job *model.Job, parsed *ai.ParsedJob) {
 			job.Location = cities[0]
 		}
 	}
-	if parsed.JobType != "" {
-		job.JobType = parsed.JobType
+	if v := cleanJobScalar(parsed.JobType); v != "" {
+		job.JobType = v
 	}
 	if parsed.GraduationYear > 0 {
 		y := parsed.GraduationYear
@@ -776,6 +912,16 @@ func applyParsed(job *model.Job, parsed *ai.ParsedJob) {
 		if t := parseISODate(parsed.Deadline); t != nil {
 			job.Deadline = t
 		}
+	}
+}
+
+func cleanJobScalar(v string) string {
+	s := strings.TrimSpace(v)
+	switch strings.ToLower(s) {
+	case "", "<nil>", "nil", "null", "undefined":
+		return ""
+	default:
+		return s
 	}
 }
 

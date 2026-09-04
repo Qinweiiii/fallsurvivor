@@ -1,6 +1,9 @@
 package ai
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestMapFieldsByRuleSkipsSensitive(t *testing.T) {
 	fields := []FormField{
@@ -120,6 +123,29 @@ func TestExtractJSONObject(t *testing.T) {
 		if got := extractJSONObject(in); got != want {
 			t.Errorf("extractJSONObject(%q) = %q, 期望 %q", in, got, want)
 		}
+	}
+}
+
+func TestRepairUnescapedStringQuotes(t *testing.T) {
+	raw := `{"action":"click","reasoning":"点击"岗位投递"按钮"}`
+	repaired := repairUnescapedStringQuotes(raw)
+	want := `{"action":"click","reasoning":"点击\"岗位投递\"按钮"}`
+	if repaired != want {
+		t.Fatalf("repairUnescapedStringQuotes() = %q, want %q", repaired, want)
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(repaired), &decoded); err != nil {
+		t.Fatalf("repaired JSON must parse: %v", err)
+	}
+	if decoded["reasoning"] != `点击"岗位投递"按钮` {
+		t.Fatalf("reasoning = %q", decoded["reasoning"])
+	}
+}
+
+func TestRepairUnescapedStringQuotesKeepsValidJSON(t *testing.T) {
+	raw := `{"action":"click","reasoning":"点击\"岗位投递\"按钮"}`
+	if got := repairUnescapedStringQuotes(raw); got != raw {
+		t.Fatalf("valid JSON changed: %q", got)
 	}
 }
 

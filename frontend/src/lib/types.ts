@@ -334,10 +334,19 @@ export interface ApplicationProfileData {
 // ---------------- 站点 Recipe（数据驱动采集） ----------------
 
 /** 采集策略。第一版仅 browser 已实现。 */
-export type SiteStrategy = 'browser' | 'api' | 'url_template';
+export type SiteStrategy = 'browser' | 'api' | 'browser_observed' | 'url_template';
 
 /** Recipe 来源。 */
 export type SiteRecipeSource = 'preset' | 'manual' | 'exploration';
+
+/**
+ * Recipe 验证状态。
+ *
+ * unverified：尚未用真实请求试跑过；
+ * verified  ：已真实采到岗位；
+ * invalid   ：连续失败达阈值，下次命中会自动重新探索。
+ */
+export type SiteVerifyStatus = 'unverified' | 'verified' | 'invalid';
 
 /** 站点采集配置：描述「某公司校招站点怎么采」。 */
 export interface SiteRecipe {
@@ -349,6 +358,33 @@ export interface SiteRecipe {
   strategy_type: SiteStrategy;
   /** browser 策略下对应 Worker 侧的站点适配器 key。 */
   adapter_key: string;
+  list_api: string;
+  detail_api: string;
+  detail_url_template: string;
+  method: 'GET' | 'POST';
+  id_field: string;
+  title_field: string;
+  list_path: string;
+  keyword_param: string;
+  field_map: Record<string, string>;
+  /** POST 时实际发送的请求体（探索阶段从真实请求沉淀）。 */
+  request_body: string;
+  /** 请求体类型：application/json 或 application/x-www-form-urlencoded。 */
+  request_content_type: string;
+  /** 复现接口所需的非凭证请求头。 */
+  request_headers: Record<string, string>;
+  /** 关键词是否放在请求体里（而非 URL query）。 */
+  keyword_in_body: boolean;
+  /** 验证状态：只有 verified 才是真跑通过的配置。 */
+  verify_status: SiteVerifyStatus;
+  /** 最近一次验证通过时间。 */
+  verified_at: string | null;
+  /** 验证时实际采到的岗位数。 */
+  verified_jobs: number;
+  /** 连续失败次数；达到阈值即标记 invalid 并触发重新探索。 */
+  consecutive_failures: number;
+  /** 最近一次失败原因。 */
+  last_error: string;
   enabled: boolean;
   /** 单次搜索最多返回岗位数。 */
   max_jobs_per_search: number;
@@ -376,4 +412,95 @@ export interface SiteRecipeRun {
   error_message: string;
   duration_ms: number;
   created_at: string;
+}
+
+/**
+ * 一次手动验证的结果。
+ *
+ * 判定口径与探索阶段的自动验证一致：拿到 HTTP 200 不算通过，
+ * 必须真解析出带标题的岗位。
+ */
+export interface SiteRecipeVerifyResult {
+  ok: boolean;
+  jobs_found: number;
+  sample_titles?: string[];
+  field_quality?: SiteRecipeFieldQuality[];
+  error?: string;
+  response_sample?: string;
+}
+
+export interface SiteRecipeFieldQuality {
+  field: string;
+  ok: boolean;
+  hit: number;
+  total: number;
+  samples?: string[];
+}
+
+export interface SiteCrawlRequest {
+  site_key: string;
+  company: string;
+  url: string;
+  keyword?: string;
+  strategy?: 'auto' | 'api' | 'script' | 'ai' | 'explore';
+  save_as_recipe?: boolean;
+}
+
+export interface SiteCrawlJobSummary {
+  title: string;
+  url?: string;
+  department?: string;
+}
+
+export interface SiteExploreTraceStep {
+  step: number;
+  action: string;
+  target?: string;
+  reasoning?: string;
+  result?: string;
+  confidence?: number;
+  new_requests?: number;
+}
+
+export interface SiteRecipeCandidate {
+  list_api?: string;
+  detail_api?: string;
+  detail_url_template?: string;
+  method?: string;
+  request_body?: string;
+  request_content_type?: string;
+  request_headers?: Record<string, string>;
+  id_field?: string;
+  title_field?: string;
+  list_path?: string;
+  keyword_param?: string;
+  keyword_in_body?: boolean;
+  field_map?: Record<string, string>;
+  notes?: string;
+  confidence?: number;
+}
+
+export interface SiteCrawlResult {
+  site_key: string;
+  site_name: string;
+  company: string;
+  count: number;
+  jobs: SiteCrawlJobSummary[];
+  strategy: string;
+  recipe_id?: string;
+  saved?: boolean;
+  verified?: boolean;
+  verified_jobs?: number;
+  verify_samples?: string[];
+  field_quality?: SiteRecipeFieldQuality[];
+  refine_rounds?: number;
+  duration_ms?: number;
+  ingested?: number;
+  duplicate?: number;
+  skipped?: number;
+  skipped_reasons?: Record<string, number>;
+  ingest_status?: 'not_started' | string;
+  next_action?: string;
+  trace?: SiteExploreTraceStep[];
+  candidate?: SiteRecipeCandidate;
 }

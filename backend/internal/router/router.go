@@ -59,11 +59,8 @@ func BuildServices(cfg *config.Config, store *repository.Store, enqueuer *asynq.
 	// 来源注册：Tavily 作为底层搜索能力，Official / BOSS 复用它做定向发现。
 	tavily := source.NewTavilySource(cfg.Tavily)
 	registry := source.NewRegistry(
-		// 腾讯官方公开接口：无需登录、无需浏览器、零 LLM token，优先注册。
-		source.NewTencentSource(nil),
 		source.NewOfficialSource(tavily, source.DefaultCompanyAdapters, 6),
 		source.NewBossSource(tavily),
-		tavily,
 	)
 
 	pipeline := searchsvc.NewPipeline(store, registry, llm, fetcher)
@@ -87,15 +84,18 @@ func BuildServices(cfg *config.Config, store *repository.Store, enqueuer *asynq.
 		// 预置写入失败不阻断启动：退化为空 Registry，全部走通用发现路径。
 		slogWarn("站点 Recipe 预置写入失败（将全部走通用发现路径）", err)
 	}
+	if err := store.Site.Inner().SeedPlaybook(context.Background()); err != nil {
+		slogWarn("探索 Playbook 预置写入失败（探索仍可运行，但不会获得通用经验提示）", err)
+	}
 	if err := siteReg.Load(context.Background()); err != nil {
 		slogWarn("站点 Recipe 装载失败（将全部走通用发现路径）", err)
 	}
-	discovery := searchsvc.NewDiscoveryService(siteReg, siteCrawler, store.Site.Inner())
+	discovery := searchsvc.NewDiscoveryService(siteReg, siteCrawler, store.Site.Inner(), fetcher)
 
 	// ---- Exploration Agent ----
 	// 只在 Fast Path 未命中时启用：自动探索未知站点的采集方式，
 	// 产出候选并可保存为新 Recipe，使下次直接走 Fast Path。
-	discovery.AttachExplorer(searchsvc.NewExplorer(browserClient, llm))
+	discovery.AttachExplorer(searchsvc.NewExplorer(browserClient, llm, store.Site.Inner()))
 
 	// ---- JD 补全服务 ----
 	// BOSS 等站点受反爬限制只能拿到摘要，这里复用用户已登录的浏览器会话
@@ -159,6 +159,8 @@ func New(cfg *config.Config, store *repository.Store, svcs *Services) *gin.Engin
 	// 注入站点发现服务，让 /api/jobs/crawl 支持 Recipe Fast Path。
 	searchH.AttachDiscovery(svcs.Discovery)
 	siteH := handler.NewSiteRecipeHandler(store.Site.Inner())
+	// 注入发现服务，让配置页支持「立即用真实请求验证这条配置」。
+	siteH.AttachDiscovery(svcs.Discovery)
 	enrichH := handler.NewEnrichmentHandler(svcs.Enrichment, store)
 	exploreH := handler.NewExploreHandler(svcs.Discovery)
 	appH := handler.NewApplicationHandler(svcs.Application, store)
@@ -254,6 +256,8 @@ func New(cfg *config.Config, store *repository.Store, svcs *Services) *gin.Engin
 		api.PUT("/site-recipes/:id", siteH.Update)
 		api.DELETE("/site-recipes/:id", siteH.Delete)
 		api.GET("/site-recipes/:id/runs", siteH.Runs)
+		// 用真实请求验证配置能否采到岗位，并写回健康度。
+		api.POST("/site-recipes/:id/verify", siteH.Verify)
 	}
 
 	r.NoRoute(func(c *gin.Context) {

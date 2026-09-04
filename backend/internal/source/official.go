@@ -124,9 +124,10 @@ func (s *OfficialSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, e
 	// 从检索式里推断岗位方向关键词。
 	roles := extractRoleHints(q.Queries)
 
-	adapters := s.adapters
-	if len(adapters) > s.maxCompanies {
-		adapters = adapters[:s.maxCompanies]
+	adapters := s.selectAdapters(q.CompanyPreferences)
+	if len(adapters) == 0 {
+		slog.Debug("official: 无匹配的官方公司偏好，跳过官网来源")
+		return nil, nil
 	}
 
 	var (
@@ -146,6 +147,7 @@ func (s *OfficialSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, e
 	sub := SearchQuery{
 		Queries:            queries,
 		Locations:          q.Locations,
+		CompanyPreferences: q.CompanyPreferences,
 		GraduationYear:     q.GraduationYear,
 		MaxResultsPerQuery: 5,
 	}
@@ -173,6 +175,27 @@ func (s *OfficialSource) Search(ctx context.Context, q SearchQuery) ([]RawJob, e
 
 	slog.Debug("official: 定向搜索完成", "queries", len(queries), "hits", len(out))
 	return out, nil
+}
+
+func (s *OfficialSource) selectAdapters(prefs []string) []CompanyAdapter {
+	specific := specificCompanyPrefs(prefs)
+	hasBroad := hasBroadCompanyPref(prefs)
+
+	var out []CompanyAdapter
+	if len(specific) > 0 {
+		for _, a := range s.adapters {
+			if adapterMatchesAny(a, specific) {
+				out = append(out, a)
+			}
+		}
+	} else if hasBroad || len(prefs) == 0 {
+		out = append(out, s.adapters...)
+	}
+
+	if len(out) > s.maxCompanies {
+		out = out[:s.maxCompanies]
+	}
+	return out
 }
 
 // matchDomainOwner 判断 host 是否属于已登记的公司域名。

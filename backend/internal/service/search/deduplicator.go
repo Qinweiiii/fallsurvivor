@@ -63,7 +63,8 @@ func DedupInBatch(raws []source.RawJob) ([]Candidate, []source.RawJob, DedupStat
 			continue
 		}
 
-		normURL := NormalizeURL(raw.URL)
+		identityURL := firstNonEmpty(raw.IdentityURL, raw.URL)
+		normURL := NormalizeURL(identityURL)
 		if normURL == "" {
 			stats.DroppedInvalid++
 			continue

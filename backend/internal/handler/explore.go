@@ -71,12 +71,19 @@ func (h *ExploreHandler) Explore(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{
-		"success":     res.Success,
-		"saved":       res.Saved,
-		"reason":      res.Reason,
-		"candidate":   res.Candidate,
-		"recipe":      res.Recipe,
-		"trace":       res.Trace,
-		"duration_ms": res.DurationMS,
+		"success":   res.Success,
+		"saved":     res.Saved,
+		"reason":    res.Reason,
+		"candidate": res.Candidate,
+		"recipe":    res.Recipe,
+		"trace":     res.Trace,
+		// 验证闭环的产出：配置是否真跑通、采到多少条、样例标题，
+		// 以及为跑通做了几轮自修正。没有这些，"探索成功"只是模型自我声明。
+		"verified":       res.Verified,
+		"verified_jobs":  res.VerifiedJobs,
+		"verify_samples": res.VerifySampleTitles,
+		"field_quality":  res.FieldQuality,
+		"refine_rounds":  res.RefineRounds,
+		"duration_ms":    res.DurationMS,
 	})
 }

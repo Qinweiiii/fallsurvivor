@@ -27,7 +27,9 @@ var trackingParams = map[string]bool{
 //   - 统一小写 scheme 与 host，去掉 www. 前缀；
 //   - 去掉默认端口；
 //   - 剔除追踪类 query 参数，其余参数按 key 排序；
-//   - 去掉 fragment 与末尾斜杠。
+//   - 去掉普通 fragment 与末尾斜杠；
+//   - 保留系统生成的岗位身份 fragment（如 #job_id=123），避免 API 型
+//     Recipe 在没有真实详情 URL 时把不同岗位归一化成同一个列表接口。
 func NormalizeURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -63,7 +65,8 @@ func NormalizeURL(raw string) string {
 		}
 	}
 	u.RawQuery = q.Encode() // Encode 已按 key 排序
-	u.Fragment = ""
+	fragment := normalizedIdentityFragment(u.Fragment)
+	u.Fragment = fragment
 	u.RawFragment = ""
 	u.User = nil
 
@@ -73,6 +76,28 @@ func NormalizeURL(raw string) string {
 	}
 
 	return u.String()
+}
+
+func normalizedIdentityFragment(fragment string) string {
+	f := strings.TrimSpace(fragment)
+	if f == "" {
+		return ""
+	}
+	parts := strings.SplitN(f, "=", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(parts[0]))
+	value := strings.TrimSpace(parts[1])
+	if value == "" {
+		return ""
+	}
+	switch key {
+	case "job_id", "jobid", "position_id", "positionid", "post_id", "postid", "id":
+		return key + "=" + value
+	default:
+		return ""
+	}
 }
 
 // 公司名清洗用的后缀与噪声词。按长度从长到短排列，确保优先匹配长后缀。

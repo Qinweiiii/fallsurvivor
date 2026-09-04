@@ -2,15 +2,18 @@ package search
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
 	"github.com/eddiel/fallsurvivor/backend/internal/browser"
+	"github.com/eddiel/fallsurvivor/backend/internal/executor"
 	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/google/uuid"
 )
@@ -22,13 +25,14 @@ import (
 // 探索是昂贵且不确定的，能避免就避免。
 //
 // 安全边界（与既有 browser 层一致）：
-//   - 所有动作经 Worker 执行，Worker 侧拒绝点击提交/投递类元素；
+//   - 所有动作经 Worker 执行，Worker 侧不执行任意 JS；
 //   - navigate 仅允许 http/https 公网地址；
 //   - 步数有上限，避免无限循环；
-//   - 全程只读页面与网络，不执行任何 JS。
+//   - 主流程只读取页面与网络响应，优先确认岗位列表路径。
 type Explorer struct {
 	browser *browser.Client
 	llm     *ai.Client
+	repo    *site.Repository
 
 	// maxSteps 单次探索的最大步数。
 	maxSteps int
@@ -39,10 +43,11 @@ type Explorer struct {
 }
 
 // NewExplorer 构造探索器。
-func NewExplorer(bc *browser.Client, llm *ai.Client) *Explorer {
+func NewExplorer(bc *browser.Client, llm *ai.Client, repo *site.Repository) *Explorer {
 	return &Explorer{
 		browser:             bc,
 		llm:                 llm,
+		repo:                repo,
 		maxSteps:            defaultExploreMaxSteps,
 		confidenceThreshold: defaultConfidenceThreshold,
 		topNCandidates:      defaultTopNCandidates,
@@ -51,8 +56,7 @@ func NewExplorer(bc *browser.Client, llm *ai.Client) *Explorer {
 
 // 探索流程的默认值。
 const (
-	// defaultExploreMaxSteps 单次探索最多走多少步。
-	// 与既有 crawlMaxSteps(18) 保持同一量级，避免长时间占用浏览器。
+	// defaultExploreMaxSteps 单次探索最多走多少步，作为防止无界循环的安全边界。
 	defaultExploreMaxSteps = 12
 	// defaultConfidenceThreshold 信心达到该值即认为已找到，提前结束。
 	defaultConfidenceThreshold = 80
@@ -74,10 +78,20 @@ type ExploreRequest struct {
 
 // ExploreResult 探索结果。
 type ExploreResult struct {
+	// RunID 是持久化探索记录 ID；失败时可据此直接查看完整轨迹。
+	RunID string
 	// Success 是否成功产出可用配置。
 	Success bool
 	// Candidate 产出的采集配置候选；失败时为 nil。
 	Candidate *ai.RecipeCandidate
+	// Observed 本次探索累计观测到的网络请求候选（含请求侧信息）。
+	//
+	// 保留它是为了支撑「验证失败 → 自修正」：模型重新分析时需要回看
+	// 原始观测数据，否则只能凭错误信息盲改。
+	Observed []ai.ExploreRequestView
+	// DetailContents 是首次探索实际打开并通过 JD 质量检查的详情页正文，
+	// key 为已验证的真实详情 URL。它只来自浏览器可见页面，不会触发接口复放。
+	DetailContents map[string]string
 	// Steps 实际执行的步数。
 	Steps int
 	// Trace 执行轨迹，便于排查与展示。
@@ -92,10 +106,13 @@ type ExploreResult struct {
 type ExploreStepTrace struct {
 	Step       int    `json:"step"`
 	Action     string `json:"action"`
+	TargetRef  string `json:"target_ref,omitempty"`
 	Target     string `json:"target"`
 	Reasoning  string `json:"reasoning"`
 	Result     string `json:"result"`
 	Confidence int    `json:"confidence"`
+	// CurrentURL 是动作完成后的页面地址；保存 Recipe 时用于确定下次的入口页。
+	CurrentURL string `json:"current_url,omitempty"`
 	// NewRequests 该步新增的网络请求数。
 	NewRequests int `json:"new_requests"`
 }
@@ -122,6 +139,7 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 		siteKey = "generic"
 	}
 	taskID := uuid.NewString()
+	defer e.recordExploreRun(context.WithoutCancel(ctx), siteKey, req, result)
 
 	// 打开会话：需要登录态才能看到真实岗位数据。
 	session, err := e.browser.OpenSession(ctx, browser.SessionRequest{
@@ -156,9 +174,17 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 		return nil, fmt.Errorf("启动网络观测失败: %w", err)
 	}
 
-	// 首屏加载往往已经触发了列表接口，先观测一次。
+	// Observer 是打开页面后才启动的，主动重载一次避免错过首屏列表接口。
+	if _, navErr := e.browser.NavAct(ctx, taskID, browser.NavAction{
+		Type: browser.NavNavigate,
+		URL:  session.CurrentURL,
+	}); navErr != nil {
+		slog.Warn("探索重载页面失败", "error", navErr.Error())
+	}
+	// 首屏请求可能就是列表接口，先观测一次。搜索必须等页面快照提供了
+	// 精确输入框 ref 后再执行，不能在这里用 CSS 全页扫描猜目标元素。
 	time.Sleep(exploreWaitAfterAction * time.Second)
-	_, candidates, err := e.browser.ObserveDiff(ctx, taskID, baseline, 50, e.topNCandidates)
+	observeCursor, _, candidates, err := e.browser.ObserveDiff(ctx, taskID, baseline, 50, e.topNCandidates)
 	if err != nil {
 		slog.Warn("首屏观测失败", "error", err.Error())
 	}
@@ -166,9 +192,14 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 	// 记录全部观测到的候选，供最终 Builder 使用。
 	allCandidates := make([]ai.ExploreRequestView, 0, 32)
 	allCandidates = append(allCandidates, toRequestViews(candidates)...)
-
+	keywordAttempted := false
 	lastResult := "已进入站点首页"
+	playbook := e.loadPlaybook(ctx)
 	var decision *ai.ExploreDecision
+	modelFinished := false
+	lastFingerprint := ""
+	stagnantSteps := 0
+	inspectedSeqs := map[int]bool{}
 
 	for step := 1; step <= e.maxSteps; step++ {
 		// 观测当前页面。
@@ -177,15 +208,26 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 			slog.Warn("读取页面快照失败", "step", step, "error", snapErr.Error())
 		}
 
+		fingerprint := pageFingerprint(snap, session.CurrentURL)
+		if fingerprint != "" && fingerprint == lastFingerprint {
+			stagnantSteps++
+		} else {
+			stagnantSteps = 0
+			lastFingerprint = fingerprint
+		}
+
 		obs := ai.ExploreObservation{
 			Step:             step,
 			CurrentURL:       currentURLOr(snap, session.CurrentURL),
 			PageTitle:        titleOr(snap),
 			TextSample:       textSampleOr(snap),
 			CardSamples:      cardSamplesOr(snap),
+			Playbook:         playbook,
 			Elements:         toElementViews(snap),
 			NewRequests:      toRequestViews(candidates),
 			LastActionResult: lastResult,
+			ActionHistory:    recentActionHistory(result.Trace, 6),
+			ProgressHint:     progressHint(stagnantSteps, lastResult),
 		}
 
 		// 模型决策。
@@ -195,20 +237,68 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 			break
 		}
 
+		keywordProbePending := shouldProbeKeyword(req.Keyword, obs, allCandidates, keywordAttempted)
+		if keywordProbePending && shouldUseKeywordProbe(decision, e.confidenceThreshold) {
+			decision = &ai.ExploreDecision{
+				Action:     string(ai.ExploreSearch),
+				TargetRef:  searchInputRef(obs.Elements, ""),
+				Target:     strings.TrimSpace(req.Keyword),
+				Confidence: 45,
+				Reasoning:  "先验证关键词搜索路径",
+			}
+		}
+		if decision.Action == string(ai.ExploreSearch) {
+			decision.TargetRef = searchInputRef(obs.Elements, decision.TargetRef)
+		}
+		if decision.Action == string(ai.ExploreInspect) {
+			if seq := inspectSeq(decision.Target, decision.TargetRef); seq > 0 && inspectedSeqs[seq] {
+				if next := firstUninspectedRequest(toRequestViews(candidates), inspectedSeqs); next > 0 {
+					decision.Target = strconv.Itoa(next)
+					decision.TargetRef = ""
+					decision.Reasoning = "避免重复 inspect，改查下一个候选请求"
+				} else if keywordProbePending {
+					decision.Action = string(ai.ExploreSearch)
+					decision.TargetRef = searchInputRef(obs.Elements, "")
+					decision.Target = strings.TrimSpace(req.Keyword)
+					decision.Confidence = 45
+					decision.Reasoning = "候选请求已检查过，改用关键词搜索触发新请求"
+				} else {
+					decision.Target = strconv.Itoa(seq)
+					decision.TargetRef = ""
+					decision.Reasoning = "重复 inspect 已拒绝，请根据历史选择新的页面动作"
+				}
+			}
+		}
+
 		trace := ExploreStepTrace{
 			Step:        step,
 			Action:      decision.Action,
+			TargetRef:   decision.TargetRef,
 			Target:      decision.Target,
 			Reasoning:   decision.Reasoning,
 			Confidence:  decision.Confidence,
 			NewRequests: len(candidates),
 		}
 
+		// 每步都落日志：探索是耗时数十秒的多步流程，
+		// 失败时若只有最终结论，根本判断不出是「没走到列表页」
+		// 还是「走到了但没认出接口」——两者的修法完全不同。
+		slog.Info("探索步骤",
+			"site_key", siteKey,
+			"step", step,
+			"action", decision.Action,
+			"target_ref", decision.TargetRef,
+			"target", truncateForLog(decision.Target, 120),
+			"confidence", decision.Confidence,
+			"new_requests", len(candidates),
+			"reasoning", truncateForLog(decision.Reasoning, 100))
+
 		// 结束条件。
 		if decision.Action == string(ai.ExploreFinish) {
 			trace.Result = "判定已找到数据接口"
 			result.Trace = append(result.Trace, trace)
 			result.Steps = step
+			modelFinished = true
 			break
 		}
 		if decision.Action == string(ai.ExploreAbort) {
@@ -219,23 +309,66 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 			result.DurationMS = time.Since(start).Milliseconds()
 			return result, nil
 		}
+		if decision.Action == string(ai.ExploreInspect) {
+			seq := inspectSeq(decision.Target, decision.TargetRef)
+			if seq > 0 && inspectedSeqs[seq] {
+				trace.Result = fmt.Sprintf("拒绝重复 inspect 请求 %d；该请求已读取且没有新候选，请选择其他页面动作", seq)
+				result.Trace = append(result.Trace, trace)
+				lastResult = trace.Result
+				continue
+			}
+		}
 
 		// 执行动作。
-		execMsg, execOK := e.executeAction(ctx, taskID, decision, req.Keyword)
+		execRes := e.executeAction(ctx, taskID, decision, req.Keyword)
+		execMsg, execOK := execRes.Message, execRes.OK
 		trace.Result = execMsg
+		trace.CurrentURL = execRes.CurrentURL
 		lastResult = execMsg
+		if execOK && actionUsesKeyword(decision, req.Keyword) {
+			keywordAttempted = true
+		}
+		if execOK && decision.Action == string(ai.ExploreInspect) {
+			if seq := inspectSeq(decision.Target, decision.TargetRef); seq > 0 {
+				inspectedSeqs[seq] = true
+			}
+		}
 		result.Trace = append(result.Trace, trace)
+		if execRes.Inspected != nil {
+			allCandidates = mergeRequestViews(allCandidates, []ai.ExploreRequestView{*execRes.Inspected})
+			candidates = mergeRankedRequests(candidates, *execRes.Inspected)
+		}
 
-		// 动作后等待异步请求完成，再观测新增请求。
+		// 动作后等待异步请求完成，再观测新增请求与页面状态。
 		time.Sleep(exploreWaitAfterAction * time.Second)
-		_, candidates, err = e.browser.ObserveDiff(ctx, taskID, baseline, 50, e.topNCandidates)
+		observeCursor, _, candidates, err = e.browser.ObserveDiff(ctx, taskID, observeCursor, 50, e.topNCandidates)
 		if err != nil {
 			slog.Warn("观测新增请求失败", "step", step, "error", err.Error())
 			candidates = nil
 		}
+		afterSnap, afterSnapErr := e.browser.Snapshot(ctx, taskID)
+		stateChanged := afterSnapErr == nil && actionChangedPage(snap, afterSnap)
+		if execOK && !stateChanged && len(candidates) == 0 && decision.Action != string(ai.ExploreInspect) {
+			execOK = false
+			execMsg += "；未观测到页面或候选数据变化"
+			lastResult = execMsg
+		}
 		trace.NewRequests = len(candidates)
+		trace.Result = execMsg
+		// 打印本步新观测到的候选接口，便于判断导航是否真的走到了列表页。
+		// 只打 URL 与打分，不打响应内容（可能含个人信息）。
+		for _, c := range candidates {
+			slog.Debug("探索观测候选",
+				"step", step,
+				"method", c.Record.Method,
+				"url", truncateForLog(c.Record.URL, 160),
+				"status", c.Record.Status,
+				"score", c.Score,
+				"has_request_body", c.Record.RequestBody != "")
+		}
 		if n := len(result.Trace); n > 0 {
 			result.Trace[n-1].NewRequests = len(candidates)
+			result.Trace[n-1].Result = execMsg
 		}
 		// 累计候选，去重后供 Builder 使用。
 		allCandidates = mergeRequestViews(allCandidates, toRequestViews(candidates))
@@ -245,24 +378,35 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 			slog.Debug("探索动作执行失败", "step", step, "action", decision.Action, "msg", execMsg)
 		}
 
-		// 信心足够高也提前结束。
-		if decision.Confidence >= e.confidenceThreshold && len(candidates) > 0 {
-			result.Steps = step
-			break
-		}
 		if step == e.maxSteps {
 			result.Steps = step
 		}
 	}
 
+	// 步数上限只是安全边界，不是“已找到接口”的替代判断。只有模型明确
+	// finish 后才允许生成并沉淀 Recipe，避免规则路径意外产出错误配置。
+	if !modelFinished {
+		if result.Reason == "" {
+			result.Reason = fmt.Sprintf("达到探索步数上限（%d），模型未确认岗位列表路径", e.maxSteps)
+		}
+		result.DurationMS = time.Since(start).Milliseconds()
+		return result, nil
+	}
+
 	// 由观测数据产出配置候选。
+	// 无论后续成败都带上观测数据：自修正阶段要靠它回看原始请求。
+	result.Observed = allCandidates
 	if len(allCandidates) == 0 {
 		result.Reason = joinReason("未观测到任何可用的数据请求", loginWarn)
 		result.DurationMS = time.Since(start).Milliseconds()
 		return result, nil
 	}
 
-	candidate, err := e.llm.BuildRecipeCandidate(ctx, allCandidates, req.EntryURL)
+	// 同一页面可能并行出现埋点、默认列表和搜索结果等多种请求。用户给了
+	// 关键词时，配置只能基于实际携带该关键词的强列表信号生成，避免模型
+	// 从混合候选中误选默认列表请求。
+	candidateInputs := recipeCandidateInputs(allCandidates, req.Keyword)
+	candidate, err := e.llm.BuildRecipeCandidate(ctx, candidateInputs, req.EntryURL)
 	if err != nil {
 		result.Reason = joinReason("生成采集配置失败: "+err.Error(), loginWarn)
 		result.DurationMS = time.Since(start).Milliseconds()
@@ -273,10 +417,33 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 		result.DurationMS = time.Since(start).Milliseconds()
 		return result, nil
 	}
+	if strings.TrimSpace(candidate.ListPath) == "" || strings.TrimSpace(candidate.TitleField) == "" {
+		result.Reason = joinReason("已识别列表接口，但缺少 list_path 或 title_field，暂不保存为可执行 Recipe", loginWarn)
+		result.DurationMS = time.Since(start).Milliseconds()
+		return result, nil
+	}
+	// Builder 能从请求模式中推测详情地址，但推测不能写入 Recipe。详情路径
+	// 必须由当前浏览器实际打开的页面反推，避免把幻觉 URL 带入 Fast Path。
+	candidate.DetailAPI = ""
+	candidate.DetailURLTemplate = ""
+	if candidateNeedsDetail(candidate) {
+		detail := e.discoverDetailPage(ctx, taskID, candidate, allCandidates)
+		if detail != nil {
+			candidate.IDField = detail.Identifier.Field
+			if candidate.FieldMap == nil {
+				candidate.FieldMap = map[string]string{}
+			}
+			candidate.FieldMap["id"] = detail.Identifier.Field
+			candidate.DetailURLTemplate = detail.Template
+			result.DetailContents = map[string]string{detail.URL: detail.Content}
+			slog.Info("探索确认岗位详情页模板", "site_key", siteKey, "template", truncateForLog(detail.Template, 160))
+		}
+	}
 
 	result.Success = true
 	result.Candidate = candidate
 	result.DurationMS = time.Since(start).Milliseconds()
+	e.recordPlaybookHits(context.WithoutCancel(ctx), candidate, allCandidates)
 
 	slog.Info("站点探索完成",
 		"site_key", siteKey,
@@ -285,6 +452,333 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 		"confidence", candidate.Confidence,
 		"duration_ms", result.DurationMS)
 	return result, nil
+}
+
+// recordExploreRun 在所有正常探索返回路径上保存结果，避免失败只剩一句最终错误。
+func (e *Explorer) recordExploreRun(ctx context.Context, siteKey string, req ExploreRequest, result *ExploreResult) {
+	if e.repo == nil || result == nil {
+		return
+	}
+	trace, err := json.Marshal(result.Trace)
+	if err != nil {
+		slog.Warn("序列化探索轨迹失败", "site_key", siteKey, "error", err.Error())
+		return
+	}
+	status := "failed"
+	if result.Success {
+		status = "success"
+	}
+	run := &site.ExplorationRun{
+		SiteKey:    siteKey,
+		Keyword:    req.Keyword,
+		EntryURL:   req.EntryURL,
+		Status:     status,
+		Reason:     result.Reason,
+		Trace:      trace,
+		DurationMS: result.DurationMS,
+	}
+	if err := e.repo.RecordExplorationRun(ctx, run); err != nil {
+		slog.Warn("保存探索运行记录失败", "site_key", siteKey, "error", err.Error())
+		return
+	}
+	result.RunID = run.ID
+}
+
+type discoveredDetailPage struct {
+	Identifier executor.JobIdentifier
+	Template   string
+	URL        string
+	Content    string
+}
+
+// discoverDetailPage 从一次真实点击得到详情页，并将 URL 中的列表字段精确反推为模板。
+// 列表没有 JD 时，详情页不是优化项，而是 Recipe 可用性的必要条件。
+func (e *Explorer) discoverDetailPage(
+	ctx context.Context,
+	taskID string,
+	cand *ai.RecipeCandidate,
+	observed []ai.ExploreRequestView,
+) *discoveredDetailPage {
+	if cand == nil {
+		return nil
+	}
+	draft := &site.Recipe{
+		ListAPI:    cand.ListAPI,
+		ListPath:   cand.ListPath,
+		IDField:    cand.IDField,
+		TitleField: cand.TitleField,
+		FieldMap:   jsonMapFromStrings(cand.FieldMap),
+	}
+	var identifiers []executor.JobIdentifier
+	for _, req := range observed {
+		if !sameObservedEndpoint(cand.ListAPI, req.URL) {
+			continue
+		}
+		body := firstNonEmpty(req.FullSample, req.Sample)
+		if body == "" {
+			continue
+		}
+		parsed, err := executor.APIJobIdentifiers(draft, []byte(body))
+		if err == nil && len(parsed) > 0 {
+			identifiers = parsed
+			break
+		}
+	}
+	if len(identifiers) == 0 {
+		return nil
+	}
+	snap, err := e.browser.Snapshot(ctx, taskID)
+	if err != nil {
+		return nil
+	}
+
+	// 有些 SPA 职位卡片不是 <a>，只有点击后才改变路由。此处最多请求模型
+	// 选择一次代表岗位，且只接受 click，避免列表已确认后重新进入无界探索。
+	decision, err := e.decideWithRetry(ctx, ai.ExploreObservation{
+		Step:             0,
+		CurrentURL:       snap.CurrentURL,
+		PageTitle:        snap.Title,
+		TextSample:       snap.TextSample,
+		CardSamples:      snap.CardSamples,
+		Elements:         toElementViews(snap),
+		NewRequests:      observed,
+		LastActionResult: "岗位列表已确认；请只点击一条普通岗位卡片或岗位标题以确认真实详情页 URL。不要搜索、翻页或检查接口。",
+	})
+	if err != nil || decision.Action != string(ai.ExploreClick) || strings.TrimSpace(decision.TargetRef) == "" {
+		return nil
+	}
+	if result := e.executeAction(ctx, taskID, decision, ""); !result.OK {
+		return nil
+	}
+	if _, err := e.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: exploreWaitAfterAction}); err != nil {
+		slog.Debug("详情页等待失败", "error", err.Error())
+	}
+	page, err := e.browser.ScrapePage(ctx, taskID)
+	if err != nil || page == nil || page.NeedsLogin {
+		return nil
+	}
+	content, quality := DetectDescriptionQuality(page.PageText)
+	if quality == DescQualityEmpty {
+		return nil
+	}
+	identifier, template, ok := detailTemplateFromURL(page.CurrentURL, identifiers)
+	if !ok {
+		return nil
+	}
+	return &discoveredDetailPage{Identifier: identifier, Template: template, URL: page.CurrentURL, Content: content}
+}
+
+func candidateNeedsDetail(cand *ai.RecipeCandidate) bool {
+	if cand == nil {
+		return false
+	}
+	for _, key := range []string{"description", "work_content", "responsibilities", "requirements"} {
+		if strings.TrimSpace(cand.FieldMap[key]) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func detailTemplateFromURL(rawURL string, identifiers []executor.JobIdentifier) (executor.JobIdentifier, string, bool) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return executor.JobIdentifier{}, "", false
+	}
+	values := map[string]bool{}
+	for _, value := range u.Query() {
+		for _, item := range value {
+			values[item] = true
+		}
+	}
+	for _, segment := range strings.Split(strings.Trim(u.EscapedPath(), "/"), "/") {
+		if decoded, err := url.PathUnescape(segment); err == nil && decoded != "" {
+			values[decoded] = true
+		}
+	}
+	for _, id := range identifiers {
+		if id.Value == "" || !values[id.Value] {
+			continue
+		}
+		escaped := url.QueryEscape(id.Value)
+		if strings.Contains(rawURL, escaped) {
+			return id, strings.Replace(rawURL, escaped, "{id}", 1), true
+		}
+		if strings.Contains(rawURL, id.Value) {
+			return id, strings.Replace(rawURL, id.Value, "{id}", 1), true
+		}
+	}
+	return executor.JobIdentifier{}, "", false
+}
+
+func (e *Explorer) loadPlaybook(ctx context.Context) []ai.ExploreTacticView {
+	if e.repo == nil {
+		return nil
+	}
+	tactics, err := e.repo.ListPlaybook(ctx, 8)
+	if err != nil {
+		slog.Warn("读取探索 Playbook 失败", "error", err.Error())
+		return nil
+	}
+	out := make([]ai.ExploreTacticView, 0, len(tactics))
+	for _, t := range tactics {
+		out = append(out, ai.ExploreTacticView{
+			Key:         t.TacticKey,
+			Title:       t.Title,
+			Description: t.Description,
+			HitCount:    t.HitCount,
+		})
+	}
+	return out
+}
+
+func (e *Explorer) recordPlaybookHits(ctx context.Context, cand *ai.RecipeCandidate, reqs []ai.ExploreRequestView) {
+	if e.repo == nil || cand == nil {
+		return
+	}
+	keys := inferPlaybookHits(cand, reqs)
+	if len(keys) == 0 {
+		return
+	}
+	if err := e.repo.RecordPlaybookHits(ctx, keys); err != nil {
+		slog.Warn("记录探索 Playbook 命中失败", "error", err.Error())
+	}
+}
+
+// truncateForLog 按字符（而非字节）截断日志字段，避免中文被切成乱码。
+func truncateForLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+func inferPlaybookHits(cand *ai.RecipeCandidate, reqs []ai.ExploreRequestView) []string {
+	keys := []string{"observe_initial_network", "inspect_ranked_json_schema"}
+	if strings.TrimSpace(cand.KeywordParam) != "" || strings.Contains(cand.ListAPI, "?") {
+		keys = append(keys, "try_keyword_query")
+	}
+	if len(cand.FieldMap) > 0 {
+		keys = append(keys, "identify_semantic_field_map")
+	}
+	if strings.TrimSpace(cand.DetailAPI) != "" || strings.TrimSpace(cand.DetailURLTemplate) != "" {
+		keys = append(keys, "find_detail_template")
+	}
+	// 请求体被成功沉淀，说明「照抄观测请求」这条经验起了作用。
+	if strings.TrimSpace(cand.RequestBody) != "" {
+		keys = append(keys, "copy_observed_request_body")
+	}
+	for _, r := range reqs {
+		if strings.TrimSpace(r.SchemaSummary) != "" {
+			keys = append(keys, "inspect_ranked_json_schema")
+			break
+		}
+	}
+	return dedupStrings(keys, 8)
+}
+
+func strongestJobListSignal(reqs []ai.ExploreRequestView, keyword string) *ai.ExploreRequestView {
+	var best *ai.ExploreRequestView
+	for i := range reqs {
+		r := &reqs[i]
+		if !hasStrongJobListSignal(*r, keyword) {
+			continue
+		}
+		if best == nil || r.Score > best.Score {
+			best = r
+		}
+	}
+	return best
+}
+
+func recipeCandidateInputs(reqs []ai.ExploreRequestView, keyword string) []ai.ExploreRequestView {
+	if strings.TrimSpace(keyword) == "" {
+		return reqs
+	}
+	if strong := strongestJobListSignal(reqs, keyword); strong != nil {
+		return []ai.ExploreRequestView{*strong}
+	}
+	return reqs
+}
+
+func hasStrongJobListSignal(r ai.ExploreRequestView, keyword string) bool {
+	if r.Status < 200 || r.Status >= 300 {
+		return false
+	}
+	text := strings.ToLower(r.Sample + "\n" + r.FullSample + "\n" + r.SchemaSummary)
+	if !looksLikeJSONJobArray(text) {
+		return false
+	}
+	if !hasJobTitleSignal(text) || !hasJobContentSignal(text) {
+		return false
+	}
+	if !keywordObservedInRequest(r, keyword) {
+		return false
+	}
+	return r.Score >= 80 || (hasPaginationSignal(r) && strings.TrimSpace(r.RequestBody) != "")
+}
+
+func looksLikeJSONJobArray(text string) bool {
+	return strings.Contains(text, "array[") ||
+		strings.Contains(text, `"list"`) ||
+		strings.Contains(text, `"items"`) ||
+		strings.Contains(text, `"records"`) ||
+		strings.Contains(text, `"positionlist"`) ||
+		strings.Contains(text, `"jobs"`)
+}
+
+func hasJobTitleSignal(text string) bool {
+	for _, token := range []string{"positionname", "positiontitle", "jobname", "jobtitle", "title"} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasJobContentSignal(text string) bool {
+	for _, token := range []string{
+		"workcontent", "qualification", "requirement", "responsibilit",
+		"jobduty", "workduty", "description", "duty",
+	} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPaginationSignal(r ai.ExploreRequestView) bool {
+	text := strings.ToLower(r.URL + "\n" + r.RequestBody + "\n" + r.SchemaSummary)
+	for _, token := range []string{"page", "pageno", "pageindex", "pagesize", "limit", "offset", "total"} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func keywordObservedInRequest(r ai.ExploreRequestView, keyword string) bool {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return true
+	}
+	return containsFold(r.URL, keyword) || containsFold(r.RequestBody, keyword)
+}
+
+func observedKeywordRequest(reqs []ai.ExploreRequestView, keyword string) bool {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return true
+	}
+	for _, r := range reqs {
+		if keywordObservedInRequest(r, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // decideWithRetry 让模型决策下一步动作，输出被截断时自动重试一次。
@@ -333,43 +827,79 @@ func (e *Explorer) decideWithRetry(ctx context.Context, obs ai.ExploreObservatio
 	return d, nil
 }
 
+type exploreActionResult struct {
+	Message    string
+	OK         bool
+	CurrentURL string
+	Inspected  *ai.ExploreRequestView
+}
+
 // executeAction 执行模型决策的单个动作，返回执行结果与是否成功。
-func (e *Explorer) executeAction(ctx context.Context, taskID string, d *ai.ExploreDecision, keyword string) (string, bool) {
+func (e *Explorer) executeAction(ctx context.Context, taskID string, d *ai.ExploreDecision, keyword string) exploreActionResult {
 	switch ai.ExploreActionType(d.Action) {
 	case ai.ExploreClick:
-		if d.Target == "" {
-			return "click 缺少目标文案", false
+		if d.TargetRef != "" {
+			resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
+				Type: browser.NavClickRef,
+				Ref:  d.TargetRef,
+			})
+			if err != nil {
+				return exploreActionResult{Message: "点击失败: " + err.Error()}
+			}
+			return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
 		}
+		if d.Target == "" {
+			return exploreActionResult{Message: "click 缺少 target_ref 或目标文案"}
+		}
+		// 兼容旧模型输出；新探索应优先使用 target_ref。
 		resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
 			Type: browser.NavClick,
 			Text: d.Target,
 		})
 		if err != nil {
-			return "点击失败: " + err.Error(), false
+			return exploreActionResult{Message: "点击失败: " + err.Error()}
 		}
-		return resp.Message, resp.OK
+		return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
+
+	case ai.ExploreInput:
+		if d.TargetRef == "" {
+			return exploreActionResult{Message: "input 缺少 target_ref"}
+		}
+		text := firstNonEmpty(d.Target, keyword)
+		if text == "" {
+			return exploreActionResult{Message: "input 缺少输入文本"}
+		}
+		resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
+			Type: browser.NavInputRef,
+			Ref:  d.TargetRef,
+			Text: text,
+		})
+		if err != nil {
+			return exploreActionResult{Message: "输入失败: " + err.Error()}
+		}
+		return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
 
 	case ai.ExploreScroll:
 		resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
 			Type: browser.NavScroll,
 		})
 		if err != nil {
-			return "滚动失败: " + err.Error(), false
+			return exploreActionResult{Message: "滚动失败: " + err.Error()}
 		}
-		return resp.Message, resp.OK
+		return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
 
 	case ai.ExploreNavigate:
 		if d.Target == "" {
-			return "navigate 缺少目标 URL", false
+			return exploreActionResult{Message: "navigate 缺少目标 URL"}
 		}
 		resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
 			Type: browser.NavNavigate,
 			URL:  d.Target,
 		})
 		if err != nil {
-			return "导航失败: " + err.Error(), false
+			return exploreActionResult{Message: "导航失败: " + err.Error()}
 		}
-		return resp.Message, resp.OK
+		return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
 
 	case ai.ExploreWait:
 		secs := 2
@@ -380,36 +910,156 @@ func (e *Explorer) executeAction(ctx context.Context, taskID string, d *ai.Explo
 			Type: browser.NavWait, Seconds: secs,
 		})
 		if err != nil {
-			return "等待失败: " + err.Error(), false
+			return exploreActionResult{Message: "等待失败: " + err.Error()}
 		}
-		return resp.Message, resp.OK
+		return exploreActionResult{Message: resp.Message, OK: resp.OK}
+
+	case ai.ExploreSearch:
+		searchKeyword := preferredSearchKeyword(keyword, d.Target)
+		if searchKeyword == "" {
+			return exploreActionResult{Message: "search 缺少关键词"}
+		}
+		if strings.TrimSpace(d.TargetRef) == "" {
+			return exploreActionResult{Message: "search 缺少当前页面搜索框 target_ref"}
+		}
+		resp, err := e.browser.NavAct(ctx, taskID, browser.NavAction{
+			Type:    browser.NavSearch,
+			Ref:     d.TargetRef,
+			Keyword: searchKeyword,
+		})
+		if err != nil {
+			return exploreActionResult{Message: "搜索失败: " + err.Error()}
+		}
+		return exploreActionResult{Message: resp.Message, OK: resp.OK, CurrentURL: resp.CurrentURL}
 
 	case ai.ExploreInspect:
-		// inspect 只是标记感兴趣的请求，实际内容已在 candidates.sample 中；
-		// 这里不需要额外动作，返回提示让模型继续。
-		return "已标记请求 " + d.Target + "，其内容已在候选列表中", true
+		seq := inspectSeq(d.Target, d.TargetRef)
+		if seq <= 0 {
+			return exploreActionResult{Message: "inspect 缺少有效请求 seq"}
+		}
+		record, err := e.browser.InspectRequest(ctx, taskID, seq)
+		if err != nil {
+			return exploreActionResult{Message: "inspect 失败: " + err.Error()}
+		}
+		view := requestViewFromRecord(record, 1000, []string{"已 inspect，包含更完整响应片段"})
+		return exploreActionResult{
+			Message:   fmt.Sprintf("已读取请求 %d 的完整响应片段（%d 字符）", seq, len([]rune(view.FullSample))),
+			OK:        true,
+			Inspected: &view,
+		}
 
 	default:
-		return "未知动作: " + d.Action, false
+		return exploreActionResult{Message: "未知动作: " + d.Action}
 	}
 }
 
+func preferredSearchKeyword(userKeyword, modelTarget string) string {
+	if k := strings.TrimSpace(userKeyword); k != "" {
+		return k
+	}
+	return strings.TrimSpace(modelTarget)
+}
+
+func firstPositiveInt(values ...string) int {
+	for _, value := range values {
+		n := positiveIntInString(value)
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func inspectSeq(target, targetRef string) int {
+	if n := explicitInspectSeq(target); n > 0 {
+		return n
+	}
+	if n := explicitInspectSeq(targetRef); n > 0 {
+		return n
+	}
+	return 0
+}
+
+func firstUninspectedRequest(candidates []ai.ExploreRequestView, inspected map[int]bool) int {
+	for _, c := range candidates {
+		seq := c.Seq
+		if seq > 0 && !inspected[seq] {
+			return seq
+		}
+	}
+	return 0
+}
+
+func explicitInspectSeq(value string) int {
+	s := strings.ToLower(strings.TrimSpace(value))
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n
+	}
+	if strings.HasPrefix(s, "seq:") || strings.HasPrefix(s, "seq=") {
+		return positiveIntInString(s)
+	}
+	if strings.Contains(s, "seq ") || strings.Contains(s, "seq=") || strings.Contains(s, "seq:") {
+		return positiveIntInString(s)
+	}
+	return 0
+}
+
+func positiveIntInString(value string) int {
+	start := -1
+	for i, r := range value {
+		if r >= '0' && r <= '9' {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			n, _ := strconv.Atoi(value[start:i])
+			return n
+		}
+	}
+	if start >= 0 {
+		n, _ := strconv.Atoi(value[start:])
+		return n
+	}
+	return 0
+}
+
 // toRequestViews 把 Worker 返回的候选转为模型视图。
+//
+// 必须完整带上请求侧字段（RequestBody / RequestContentType / RequestHeaders）：
+// 少了它们，模型就只能"看见响应、猜不出请求"，
+// 最终只能靠人工在代码里补站点特判分支——这正是要消除的模式。
 func toRequestViews(cands []browser.RankedNetworkRecord) []ai.ExploreRequestView {
 	out := make([]ai.ExploreRequestView, 0, len(cands))
 	for _, c := range cands {
-		out = append(out, ai.ExploreRequestView{
-			Seq:     c.Record.Seq,
-			Method:  c.Record.Method,
-			URL:     c.Record.URL,
-			Status:  c.Record.Status,
-			Size:    c.Record.Size,
-			Sample:  c.Record.Sample,
-			Score:   c.Score,
-			Reasons: c.Reasons,
-		})
+		out = append(out, requestViewFromRecord(&c.Record, c.Score, c.Reasons))
 	}
 	return out
+}
+
+func requestViewFromRecord(record *browser.NetworkRecord, score int, reasons []string) ai.ExploreRequestView {
+	if record == nil {
+		return ai.ExploreRequestView{}
+	}
+	return ai.ExploreRequestView{
+		Seq:                record.Seq,
+		Method:             record.Method,
+		URL:                record.URL,
+		Status:             record.Status,
+		Size:               record.Size,
+		Sample:             record.Sample,
+		FullSample:         record.FullSample,
+		SchemaSummary:      record.SchemaSummary,
+		RequestBody:        record.RequestBody,
+		RequestContentType: record.RequestContentType,
+		RequestHeaders:     record.RequestHeaders,
+		Score:              score,
+		Reasons:            reasons,
+	}
 }
 
 // toElementViews 把页面快照元素转为模型视图（只保留文案与 ref）。
@@ -434,24 +1084,261 @@ func toElementViews(snap *browser.ExploreSnapshot) []ai.ExploreElementView {
 			Text: text,
 			Tag:  el.Tag,
 			Type: el.InputType,
+			Href: el.Href,
 		})
 	}
 	return out
 }
 
-// mergeRequestViews 合并候选视图，按 seq 去重。
-func mergeRequestViews(base, add []ai.ExploreRequestView) []ai.ExploreRequestView {
-	seen := make(map[int]bool, len(base))
-	for _, r := range base {
-		seen[r.Seq] = true
-	}
-	for _, r := range add {
-		if !seen[r.Seq] {
-			base = append(base, r)
-			seen[r.Seq] = true
+// searchInputRef 从当前快照挑选一个可编辑的搜索输入框。它只做页面语义排序，
+// 不保存任何站点选择器；最终执行仍由 Worker 用这个瞬时 ref 精确定位。
+func searchInputRef(elements []ai.ExploreElementView, requested string) string {
+	requested = strings.TrimSpace(requested)
+	for _, el := range elements {
+		if el.Ref == requested && isSearchInputElement(el) {
+			return el.Ref
 		}
 	}
+	bestRef, bestScore := "", 0
+	for _, el := range elements {
+		if !isSearchInputElement(el) {
+			continue
+		}
+		if score := searchInputScore(el.Text); score > bestScore {
+			bestRef, bestScore = el.Ref, score
+		}
+	}
+	if bestRef != "" {
+		return bestRef
+	}
+	for _, el := range elements {
+		if isSearchInputElement(el) {
+			return el.Ref
+		}
+	}
+	return ""
+}
+
+func isSearchInputElement(el ai.ExploreElementView) bool {
+	tag := strings.ToLower(strings.TrimSpace(el.Tag))
+	typ := strings.ToLower(strings.TrimSpace(el.Type))
+	if tag == "textarea" {
+		return true
+	}
+	if tag != "input" {
+		return false
+	}
+	return typ == "" || typ == "text" || typ == "search"
+}
+
+func searchInputScore(text string) int {
+	text = strings.ToLower(strings.TrimSpace(text))
+	score := 0
+	for _, token := range []string{"岗位", "职位", "keyword", "position", "job"} {
+		if strings.Contains(text, token) {
+			score += 2
+		}
+	}
+	for _, token := range []string{"搜索", "search"} {
+		if strings.Contains(text, token) {
+			score++
+		}
+	}
+	return score
+}
+
+func recentActionHistory(trace []ExploreStepTrace, limit int) []string {
+	if limit <= 0 || len(trace) == 0 {
+		return nil
+	}
+	start := len(trace) - limit
+	if start < 0 {
+		start = 0
+	}
+	out := make([]string, 0, len(trace)-start)
+	for _, item := range trace[start:] {
+		target := firstNonEmpty(item.TargetRef, item.Target, "无目标")
+		out = append(out, fmt.Sprintf("第%d步 %s(%s)：%s", item.Step, item.Action, target, truncateForLog(item.Result, 180)))
+	}
+	return out
+}
+
+func pageFingerprint(snap *browser.ExploreSnapshot, fallbackURL string) string {
+	if snap == nil {
+		return ""
+	}
+	text := truncateForLog(snap.TextSample, 600)
+	return fmt.Sprintf("%s|%s|%d|%d|%s",
+		currentURLOr(snap, fallbackURL),
+		titleOr(snap),
+		len(snap.Elements),
+		len(snap.CardSamples),
+		text,
+	)
+}
+
+// actionChangedPage 判断动作是否改变了可见页面状态。输入框本身的写值不算成功，
+// 搜索/点击必须带来列表、页面或 URL 的可观察变化。
+func actionChangedPage(before, after *browser.ExploreSnapshot) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	return pageFingerprint(before, "") != pageFingerprint(after, "")
+}
+
+func progressHint(stagnantSteps int, lastResult string) string {
+	hints := make([]string, 0, 2)
+	if stagnantSteps >= 2 {
+		hints = append(hints, "页面状态已连续多步没有变化；不要重复同一点击/等待，应尝试其他入口、搜索、滚动或 inspect 网络候选。")
+	}
+	if strings.Contains(lastResult, "失败") || strings.Contains(lastResult, "不存在或已过期") || strings.Contains(lastResult, "未找到") {
+		hints = append(hints, "上一步动作没有成功；如果使用了过期 ref，需要先重新根据当前 elements 选择新的 target_ref。")
+	}
+	return strings.Join(hints, " ")
+}
+
+func shouldUseKeywordProbe(d *ai.ExploreDecision, confidenceThreshold int) bool {
+	if d == nil {
+		return false
+	}
+	switch d.Action {
+	case string(ai.ExploreFinish), string(ai.ExploreWait), string(ai.ExploreScroll), string(ai.ExploreInspect):
+		return true
+	default:
+		return d.Confidence >= confidenceThreshold
+	}
+}
+
+func shouldProbeKeyword(keyword string, obs ai.ExploreObservation, reqs []ai.ExploreRequestView, attempted bool) bool {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" || attempted {
+		return false
+	}
+	if !hasSearchInputElement(obs.Elements) {
+		return false
+	}
+	if containsFold(obs.CurrentURL, keyword) {
+		return false
+	}
+	for _, r := range reqs {
+		if containsFold(r.URL, keyword) || containsFold(r.RequestBody, keyword) {
+			return false
+		}
+	}
+	for _, r := range obs.NewRequests {
+		if containsFold(r.URL, keyword) || containsFold(r.RequestBody, keyword) {
+			return false
+		}
+	}
+	return true
+}
+
+func actionUsesKeyword(d *ai.ExploreDecision, keyword string) bool {
+	if d == nil || strings.TrimSpace(keyword) == "" {
+		return false
+	}
+	switch ai.ExploreActionType(d.Action) {
+	case ai.ExploreSearch:
+		return true
+	default:
+		return false
+	}
+}
+
+func hasSearchInputElement(elements []ai.ExploreElementView) bool {
+	for _, el := range elements {
+		if isSearchInputElement(el) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(s, sub string) bool {
+	s = strings.TrimSpace(s)
+	sub = strings.TrimSpace(sub)
+	if s == "" || sub == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
+}
+
+// mergeRequestViews 合并候选视图，按 seq 去重。
+func mergeRequestViews(base, add []ai.ExploreRequestView) []ai.ExploreRequestView {
+	seen := make(map[int]int, len(base))
+	for i, r := range base {
+		seen[r.Seq] = i
+	}
+	for _, r := range add {
+		if idx, ok := seen[r.Seq]; ok {
+			base[idx] = richerRequestView(base[idx], r)
+			continue
+		}
+		base = append(base, r)
+		seen[r.Seq] = len(base) - 1
+	}
 	return base
+}
+
+func richerRequestView(a, b ai.ExploreRequestView) ai.ExploreRequestView {
+	out := a
+	if len([]rune(b.FullSample)) > len([]rune(out.FullSample)) {
+		out.FullSample = b.FullSample
+	}
+	if len([]rune(b.Sample)) > len([]rune(out.Sample)) {
+		out.Sample = b.Sample
+	}
+	if len([]rune(b.SchemaSummary)) > len([]rune(out.SchemaSummary)) {
+		out.SchemaSummary = b.SchemaSummary
+	}
+	if b.Score > out.Score {
+		out.Score = b.Score
+	}
+	if len(b.Reasons) > len(out.Reasons) {
+		out.Reasons = b.Reasons
+	}
+	if b.RequestBody != "" {
+		out.RequestBody = b.RequestBody
+	}
+	if b.RequestContentType != "" {
+		out.RequestContentType = b.RequestContentType
+	}
+	if len(b.RequestHeaders) > 0 {
+		out.RequestHeaders = b.RequestHeaders
+	}
+	return out
+}
+
+func mergeRankedRequests(base []browser.RankedNetworkRecord, view ai.ExploreRequestView) []browser.RankedNetworkRecord {
+	record := browser.NetworkRecord{
+		Seq:                view.Seq,
+		Method:             view.Method,
+		URL:                view.URL,
+		Status:             view.Status,
+		Size:               view.Size,
+		Sample:             view.Sample,
+		FullSample:         view.FullSample,
+		SchemaSummary:      view.SchemaSummary,
+		RequestBody:        view.RequestBody,
+		RequestContentType: view.RequestContentType,
+		RequestHeaders:     view.RequestHeaders,
+	}
+	for i, r := range base {
+		if r.Record.Seq != view.Seq {
+			continue
+		}
+		base[i] = browser.RankedNetworkRecord{
+			Record:  record,
+			Score:   view.Score,
+			Reasons: view.Reasons,
+		}
+		return base
+	}
+	return append(base, browser.RankedNetworkRecord{
+		Record:  record,
+		Score:   view.Score,
+		Reasons: view.Reasons,
+	})
 }
 
 // currentURLOr 安全取当前 URL。

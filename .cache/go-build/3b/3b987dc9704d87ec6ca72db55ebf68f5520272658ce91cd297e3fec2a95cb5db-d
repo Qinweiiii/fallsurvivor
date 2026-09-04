@@ -1,0 +1,6 @@
+./exploration_run.go
+./playbook.go
+./preset.go
+./recipe.go
+./registry.go
+./repository.go

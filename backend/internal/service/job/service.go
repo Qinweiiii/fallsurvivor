@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
@@ -46,6 +47,7 @@ func (s *Service) List(ctx context.Context, userID model.ID, f repository.JobFil
 
 	items := make([]ListItem, 0, len(jobs))
 	for _, j := range jobs {
+		sanitizeJobOutput(&j)
 		items = append(items, ListItem{Job: j, InCart: inCart[j.ID]})
 	}
 	return items, total, nil
@@ -66,6 +68,7 @@ func (s *Service) GetDetail(ctx context.Context, userID, jobID model.ID) (*Detai
 	if err != nil {
 		return nil, err
 	}
+	sanitizeJobOutput(j)
 
 	sources, err := s.store.Job.ListSources(ctx, jobID)
 	if err != nil {
@@ -87,6 +90,106 @@ func (s *Service) GetDetail(ctx context.Context, userID, jobID model.ID) (*Detai
 		return nil, err
 	}
 	return d, nil
+}
+
+func sanitizeJobOutput(j *model.Job) {
+	if j == nil {
+		return
+	}
+	j.CompanyName = cleanOutputScalar(j.CompanyName)
+	j.Department = cleanOutputScalar(j.Department)
+	j.Business = cleanOutputScalar(j.Business)
+	j.Location = cleanOutputScalar(j.Location)
+	j.JobType = cleanOutputScalar(j.JobType)
+	j.MatchAnalysis = sanitizeJSONMap(j.MatchAnalysis)
+}
+
+func cleanOutputScalar(v string) string {
+	t := strings.TrimSpace(v)
+	switch strings.ToLower(t) {
+	case "", "<nil>", "nil", "null", "undefined":
+		return ""
+	default:
+		return t
+	}
+}
+
+func sanitizeJSONMap(in model.JSONMap) model.JSONMap {
+	if len(in) == 0 {
+		return in
+	}
+	out := make(model.JSONMap, len(in))
+	for k, v := range in {
+		cleaned, ok := sanitizeJSONValue(v)
+		if ok {
+			out[k] = cleaned
+		}
+	}
+	return out
+}
+
+func sanitizeJSONValue(v any) (any, bool) {
+	switch x := v.(type) {
+	case string:
+		cleaned := cleanAnalysisText(x)
+		return cleaned, cleaned != ""
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, item := range x {
+			cleaned, ok := sanitizeJSONValue(item)
+			if ok {
+				out = append(out, cleaned)
+			}
+		}
+		return out, true
+	case []string:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			if cleaned := cleanAnalysisText(item); cleaned != "" {
+				out = append(out, cleaned)
+			}
+		}
+		return out, true
+	case map[string]any:
+		return sanitizeJSONMap(model.JSONMap(x)), true
+	case model.JSONMap:
+		return sanitizeJSONMap(x), true
+	default:
+		return v, true
+	}
+}
+
+func cleanAnalysisText(v string) string {
+	t := cleanOutputScalar(v)
+	if t == "" {
+		return ""
+	}
+	if endsWithPlaceholderValue(t) {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"<nil>", "",
+		"<Nil>", "",
+		"<NULL>", "",
+		" nil ", " ",
+		" null ", " ",
+		" undefined ", " ",
+	)
+	t = strings.TrimSpace(replacer.Replace(t))
+	t = strings.TrimRight(t, "：:，,、；;。 .")
+	return strings.TrimSpace(t)
+}
+
+func endsWithPlaceholderValue(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	for _, placeholder := range []string{"<nil>", "nil", "null", "undefined"} {
+		for _, sep := range []string{"：", ":"} {
+			if strings.HasSuffix(lower, sep+placeholder) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // FilterOptions 是筛选器的可选值。

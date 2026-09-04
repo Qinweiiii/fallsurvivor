@@ -131,7 +131,28 @@ func (c *Client) completeJSON(ctx context.Context, systemPrompt, userPrompt stri
 		content, retryable, err := c.doRequest(ctx, payload)
 		if err == nil {
 			lastContent = content
-			if err := json.Unmarshal([]byte(extractJSONObject(content)), out); err != nil {
+			decoded := extractJSONObject(content)
+			if err := json.Unmarshal([]byte(decoded), out); err != nil {
+				// 部分 OpenAI 兼容模型会在 JSON 字符串值中直接输出双引号，
+				// 例如："reasoning":"点击"岗位"按钮"。先严格解析，失败后
+				// 只修复词法上不可能是字符串结束符的引号，再交回标准库验证。
+				if repaired := repairUnescapedStringQuotes(decoded); repaired != decoded {
+					if repairErr := json.Unmarshal([]byte(repaired), out); repairErr == nil {
+						slog.Warn("ai: 已修复模型输出中的未转义字符串引号")
+						RecordLLMCall(LLMCallLog{
+							Timestamp:    callStart,
+							Model:        c.cfg.Model,
+							Kind:         callerKind(2),
+							SystemPrompt: systemPrompt,
+							UserPrompt:   userPrompt,
+							Response:     content,
+							DurationMS:   time.Since(callStart).Milliseconds(),
+							Attempts:     attempt,
+							Error:        "",
+						})
+						return nil
+					}
+				}
 				lastErr = fmt.Errorf("ai: 模型返回无法解析为目标结构: %w", err)
 				// 输出格式错误也重试一次，可能是偶发截断。
 				if attempt < maxAttempts {
@@ -182,6 +203,75 @@ func (c *Client) completeJSON(ctx context.Context, systemPrompt, userPrompt stri
 	return lastErr
 }
 
+// repairUnescapedStringQuotes 修复 JSON 字符串值中模型漏写反斜杠的双引号。
+// 只把“不可能结束当前字符串”的引号改写成 \"；真正的 JSON 语法仍由
+// json.Unmarshal 复验，调用方绝不因修复器本身而接受不合法的结构。
+func repairUnescapedStringQuotes(raw string) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+	inString := false
+	stringIsKey := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch != '"' || isEscapedQuote(raw, i) {
+			out.WriteByte(ch)
+			continue
+		}
+
+		if !inString {
+			inString = true
+			stringIsKey = jsonStringStartsKey(raw, i)
+			out.WriteByte(ch)
+			continue
+		}
+
+		next := nextNonSpaceByte(raw, i+1)
+		closes := (stringIsKey && next == ':') || (!stringIsKey && (next == 0 || next == ',' || next == '}' || next == ']'))
+		if closes {
+			inString = false
+			out.WriteByte(ch)
+			continue
+		}
+		out.WriteString(`\"`)
+	}
+	return out.String()
+}
+
+func isEscapedQuote(s string, index int) bool {
+	slashes := 0
+	for i := index - 1; i >= 0 && s[i] == '\\'; i-- {
+		slashes++
+	}
+	return slashes%2 == 1
+}
+
+func jsonStringStartsKey(s string, quote int) bool {
+	for i := quote - 1; i >= 0; i-- {
+		switch s[i] {
+		case ' ', '\n', '\r', '\t':
+			continue
+		case '{', ',':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func nextNonSpaceByte(s string, start int) byte {
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			return s[i]
+		}
+	}
+	return 0
+}
+
 // doRequest 执行单次 HTTP 请求，返回内容与是否可重试。
 func (c *Client) doRequest(ctx context.Context, payload []byte) (content string, retryable bool, err error) {
 	endpoint := strings.TrimRight(c.cfg.BaseURL, "/") + "/chat/completions"
@@ -211,7 +301,7 @@ func (c *Client) doRequest(ctx context.Context, payload []byte) (content string,
 		// 注意：错误信息不含 API Key。
 		return "", true, fmt.Errorf("ai: 上游返回 %d", resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
-		return "", false, fmt.Errorf("ai: 上游返回 %d", resp.StatusCode)
+		return "", false, fmt.Errorf("ai: 上游返回 %d: %s", resp.StatusCode, sanitizeUpstreamError(body))
 	}
 
 	var parsed chatResponse
@@ -227,6 +317,17 @@ func (c *Client) doRequest(ctx context.Context, payload []byte) (content string,
 
 	slog.Debug("ai: 调用完成", "total_tokens", parsed.Usage.TotalTokens)
 	return parsed.Choices[0].Message.Content, false, nil
+}
+
+func sanitizeUpstreamError(body []byte) string {
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		return "空响应"
+	}
+	if len(msg) > 500 {
+		msg = msg[:500] + "...[截断]"
+	}
+	return security.RedactText(msg)
 }
 
 // sleepBackoff 指数退避等待。

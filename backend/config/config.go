@@ -24,7 +24,7 @@ type Config struct {
 	DatabaseURL string
 	RedisURL    string
 
-	LLM  LLMConfig
+	LLM    LLMConfig
 	Tavily TavilyConfig
 
 	BrowserWorkerURL   string
@@ -130,7 +130,7 @@ func loadLLMConfig() LLMConfig {
 		return LLMConfig{
 			APIKey:  key,
 			BaseURL: getEnv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-			Model:   getEnv("QWEN_MODEL", "qwen3.7-plus"),
+			Model:   getEnv("QWEN_MODEL", "glm-5.2"),
 			Timeout: getEnvSeconds("QWEN_TIMEOUT_SECONDS", 90*time.Second, 5*time.Minute),
 		}
 	}

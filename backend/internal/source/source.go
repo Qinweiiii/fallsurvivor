@@ -14,6 +14,8 @@ type SearchQuery struct {
 	Queries []string
 	// Locations 是城市偏好，来源可用于附加过滤。
 	Locations []string
+	// CompanyPreferences 是用户画像中的公司偏好，可包含具体公司或“大厂/外企”等宽泛类别。
+	CompanyPreferences []string
 	// GraduationYear 是目标毕业届次。
 	GraduationYear int
 	// MaxResultsPerQuery 限制单条检索式返回条数。
@@ -26,8 +28,11 @@ type RawJob struct {
 	SourceType string
 	// SourceName 是具体来源名，例如 "字节跳动招聘官网"。
 	SourceName string
-	// URL 是岗位页地址。
+	// URL 是用户可访问的岗位页地址。没有真实详情页时必须为空，不能填列表 API。
 	URL string
+	// IdentityURL 是仅供去重的稳定岗位身份，不向用户展示为外链。
+	// API 型站点没有详情页 URL 时可使用列表接口加岗位 ID 作为身份。
+	IdentityURL string
 	// Title 是原始标题。
 	Title string
 	// Snippet 是摘要文本，可能就是全部可用信息。

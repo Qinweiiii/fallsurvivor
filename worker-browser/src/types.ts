@@ -86,13 +86,18 @@ export interface ScrapeResponse {
  * 导航动作：由后端 AI 决策，Worker 按类型安全执行。
  * 所有动作都受安全约束限制（见 nav_act.ts）：
  *   - 不执行任意 JS；
- *   - 禁止点击提交/投递类按钮；
+ *   - click_ref/input_ref/search 优先使用当前探索快照元素；
  *   - navigate 仅允许 http/https 公网地址。
  */
-export type NavActionType = 'click' | 'scroll' | 'navigate' | 'wait';
+export type NavActionType = 'click' | 'click_ref' | 'input_ref' | 'scroll' | 'navigate' | 'wait' | 'search' | 'back';
 
 export interface NavAction {
   type: NavActionType;
+  /**
+   * click_ref/input_ref/search：来自最近一次 /explore/snapshot 的元素 ref。
+   * search 带 ref 时必须作用于该元素，不允许重新扫描页面猜测输入框。
+   */
+  ref?: string;
   /** click：目标元素可见文案（归一化后子串匹配）。 */
   text?: string;
   /** scroll：方向，默认 down。 */
@@ -103,6 +108,8 @@ export interface NavAction {
   url?: string;
   /** wait：秒数，默认 1，限幅 0~10。 */
   seconds?: number;
+  /** search：输入到 ref 指定搜索框的关键词。未带 ref 的旧 Recipe 才允许 Worker 回退定位。 */
+  keyword?: string;
 }
 
 export interface NavActRequest {
@@ -168,6 +175,14 @@ export interface NetworkRecord {
   content_type: string;
   size: number;
   sample: string;
+  full_sample?: string;
+  schema_summary?: string;
+  /** 请求体片段（已脱敏截断）。POST 型接口的可复现关键。 */
+  request_body?: string;
+  /** 请求的 Content-Type，决定复现时该用 JSON 还是 form。 */
+  request_content_type?: string;
+  /** 请求头白名单快照（不含任何凭证类头部）。 */
+  request_headers?: Record<string, string>;
   at: number;
 }
 
@@ -215,9 +230,46 @@ export interface ObserveDiffResponse {
   candidates: RankedNetworkRecord[];
 }
 
+/** POST /explore/inspect-request 请求。 */
+export interface InspectRequestRequest {
+  task_id: string;
+  seq: number;
+}
+
+/** POST /explore/inspect-request 响应。 */
+export interface InspectRequestResponse {
+  task_id: string;
+  current_url: string;
+  record: NetworkRecord | null;
+  error?: string;
+}
+
 /** POST /explore/snapshot 请求：读取当前页面的可交互元素。 */
 export interface SnapshotRequest {
   task_id: string;
+}
+
+/** POST /page/markdown 请求：读取渲染后正文的 Markdown。 */
+export interface MarkdownRequest {
+  task_id: string;
+}
+
+/**
+ * POST /page/markdown 响应。
+ *
+ * 用于「读渲染结果」而非「逆向接口」的采集路径：
+ * 重度 SPA 站点的列表接口常带鉴权或上下文参数，脱离浏览器无法复现，
+ * 但页面本身往往无需登录就渲染出了全部岗位。
+ */
+export interface MarkdownResponse {
+  task_id: string;
+  current_url: string;
+  title: string;
+  /** 渲染后正文的 Markdown（已脱敏截断）。 */
+  markdown: string;
+  /** 是否因超长被截断。截断时调用方可考虑翻页或缩小范围。 */
+  truncated: boolean;
+  error?: string;
 }
 
 /** 页面上的一个可交互元素。 */
@@ -230,6 +282,8 @@ export interface SnapshotElement {
   aria_label: string;
   /** 元素类型（如 text / checkbox / radio / submit）。 */
   input_type: string;
+  /** 链接元素的绝对地址；为空表示该元素没有可复用链接。 */
+  href?: string;
   visible: boolean;
 }
 

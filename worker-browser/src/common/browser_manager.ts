@@ -9,8 +9,8 @@
  *   - 登录态目录权限 0700，且已被 .gitignore 排除。
  */
 
-import { chromium, type BrowserContext, type Page } from 'playwright';
-import { mkdir } from 'node:fs/promises';
+import { chromium, type BrowserContext, type ElementHandle, type Page } from 'playwright';
+import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NetworkObserver } from './network_observer.js';
@@ -33,6 +33,37 @@ export interface Session {
    * 惰性创建：只有探索流程用到时才 attach，普通爬取不产生额外开销。
    */
   network?: NetworkObserver;
+  /**
+   * 最近一次探索快照里的可交互元素句柄。
+   *
+   * 这是 browser-use selector_map 的轻量版：LLM 看到 ref，Worker 用 ref
+   * 找回当时快照中的真实元素，避免重新按文案扫描页面而点错同名控件。
+   */
+  exploreRefs?: Map<string, ElementHandle<HTMLElement>>;
+}
+
+/** 刷新探索元素句柄，并释放上一轮快照的句柄避免泄漏。 */
+export async function setExploreRefs(
+  session: Session,
+  refs: Map<string, ElementHandle<HTMLElement>>,
+): Promise<void> {
+  const previous = session.exploreRefs;
+  session.exploreRefs = refs;
+  if (!previous) return;
+  await Promise.all(
+    [...previous.values()].map(async (handle) => {
+      try {
+        await handle.dispose();
+      } catch {
+        // 元素可能已经随页面导航失效，忽略即可。
+      }
+    }),
+  );
+}
+
+/** 读取最近一次快照中的元素句柄。 */
+export function getExploreRef(session: Session, ref: string): ElementHandle<HTMLElement> | undefined {
+  return session.exploreRefs?.get(ref);
 }
 
 /** 获取（必要时创建并绑定）会话的网络观测器。 */
@@ -144,19 +175,53 @@ export async function openSession(
 
   // 注意：不传入任何 --no-sandbox / --disable-web-security 之类的参数，
   // 浏览器安全机制保持默认开启。
-  const context = await chromium.launchPersistentContext(userDataDir, {
+  // 不用 as const：Playwright 的 args 参数要求可变数组，
+  // 只读元组会导致类型不兼容。
+  const launchOptions = {
     headless: false,
     viewport: { width: 1440, height: 900 },
     locale: 'zh-CN',
     timezoneId: 'Asia/Shanghai',
     acceptDownloads: false,
     args: ['--start-maximized'],
-  });
+  };
+
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+  } catch (err) {
+    // 启动失败最常见的原因是 user-data-dir 仍被上一次的残留进程独占
+    // （报 "Target page, context or browser has been closed"）。
+    //
+    // 这种失败是**永久性**的：只要残留进程不退出，该站点后续每次都失败。
+    // 因此这里主动清掉该 profile 的锁文件再重试一次，
+    // 而不是把问题抛给调用方——否则表现就是「某个站点莫名再也打不开」。
+    const msg = err instanceof Error ? err.message : String(err);
+    await releaseProfileLocks(userDataDir);
+    try {
+      context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+    } catch {
+      throw new Error(
+        `浏览器启动失败（已尝试清理 profile 锁后重试）: ${msg}。` +
+          `若持续失败，请检查是否有残留的 Chromium 进程占用 ${userDataDir}`,
+      );
+    }
+  }
 
   const page = context.pages()[0] ?? (await context.newPage());
   page.setDefaultTimeout(30_000);
 
-  await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  // 某些风控站点会在首跳期间中断原导航，再脚本重定向到登录/验证页。
+  // 这时 Playwright 可能抛出 ERR_ABORTED；若页面实际已离开 about:blank，
+  // 应把它作为可继续的会话交给上层登录态判定，而不是留下孤立 Chromium。
+  try {
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  } catch (err) {
+    if (page.url() === 'about:blank') {
+      await context.close().catch(() => undefined);
+      throw err;
+    }
+  }
 
   const session: Session = {
     taskId,
@@ -170,15 +235,77 @@ export async function openSession(
   return session;
 }
 
-/** 关闭会话。 */
+/**
+ * 清理 Chromium profile 的独占锁文件。
+ *
+ * Chromium 用 SingletonLock / SingletonCookie / SingletonSocket 三个文件
+ * 标记「该 user-data-dir 正被占用」。进程被强制中断时这些文件会残留，
+ * 导致后续启动一直失败。
+ *
+ * 只删这三个已知的锁文件，**不触碰目录内其他任何内容**——
+ * 登录态（Cookies / Local Storage）都在同一目录下，误删会导致用户
+ * 需要重新登录每个站点。
+ */
+async function releaseProfileLocks(userDataDir: string): Promise<void> {
+  const lockNames = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+  await Promise.all(
+    lockNames.map(async (name) => {
+      try {
+        await rm(path.join(userDataDir, name), { force: true });
+      } catch {
+        // 不存在或无权限时忽略：这只是尽力而为的清理。
+      }
+    }),
+  );
+}
+
+/**
+ * 关闭会话。
+ *
+ * 必须同时关掉 context 与其底层 browser：
+ *   launchPersistentContext 启动的 Chromium，在只调用 context.close()
+ *   时进程有时不会退出（尤其上一次是被强制中断的会话）。残留进程会一直
+ *   持有 .auth/<siteKey> 这个 user-data-dir 的独占锁，导致该站点后续
+ *   再也打不开会话，报 "Target page, context or browser has been closed"。
+ *
+ *   实测这会累积到 8 个以上残留进程，且表现为「某个站点突然永久失败」，
+ *   很难联想到是上一次会话没清干净——所以这里要显式收尾，
+ *   而不是依赖调用方手动清理。
+ */
 export async function closeSession(taskId: string): Promise<void> {
   const s = sessions.get(taskId);
   if (!s) return;
   sessions.delete(taskId);
+
+  // 先取底层 browser 引用：context 关闭后就取不到了。
+  const browser = s.context.browser();
+
+  if (s.exploreRefs) {
+    await Promise.all(
+      [...s.exploreRefs.values()].map(async (handle) => {
+        try {
+          await handle.dispose();
+        } catch {
+          // 页面关闭时句柄可能已失效。
+        }
+      }),
+    );
+    s.exploreRefs = undefined;
+  }
+
   try {
     await s.context.close();
   } catch {
     // 用户可能已手动关闭浏览器，忽略。
+  }
+
+  // 再确保浏览器进程本身退出，释放 user-data-dir 锁。
+  if (browser) {
+    try {
+      await browser.close();
+    } catch {
+      // 已退出则忽略。
+    }
   }
 }
 

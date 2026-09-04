@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import { api, buildQuery, fetcher } from '@/lib/api';
 import type { CartItem, Page } from '@/lib/types';
-import { formatRelative, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
+import { firstDisplayValue, formatRelative, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/Button';
 import { Badge, jobStatusToneOf } from '@/components/ui/Badge';
@@ -186,7 +186,7 @@ export default function CartPage() {
                         </td>
                         <td className="td font-medium text-ink-800">{orDash(item.company_name)}</td>
                         <td className="td text-ink-600">
-                          {orDash(item.department || item.business)}
+                          {orDash(firstDisplayValue(item.department, item.business))}
                         </td>
                         <td className="td">
                           <button

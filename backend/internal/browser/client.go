@@ -125,19 +125,25 @@ type NavActionType string
 
 const (
 	NavClick    NavActionType = "click"
+	NavClickRef NavActionType = "click_ref"
+	NavInputRef NavActionType = "input_ref"
 	NavScroll   NavActionType = "scroll"
 	NavNavigate NavActionType = "navigate"
 	NavWait     NavActionType = "wait"
+	NavSearch   NavActionType = "search"
+	NavBack     NavActionType = "back"
 )
 
 // NavAction 是发给 Worker 的单步导航动作。
 type NavAction struct {
 	Type      NavActionType `json:"type"`
+	Ref       string        `json:"ref,omitempty"`
 	Text      string        `json:"text,omitempty"`
 	Direction string        `json:"direction,omitempty"`
 	Amount    int           `json:"amount,omitempty"`
 	URL       string        `json:"url,omitempty"`
 	Seconds   int           `json:"seconds,omitempty"`
+	Keyword   string        `json:"keyword,omitempty"`
 }
 
 // NavActRequest 是导航动作请求。
@@ -283,19 +289,32 @@ type ExploreElement struct {
 	Placeholder string `json:"placeholder"`
 	AriaLabel   string `json:"aria_label"`
 	InputType   string `json:"input_type"`
+	Href        string `json:"href"`
 	Visible     bool   `json:"visible"`
 }
 
 // NetworkRecord 是观测到的一个网络请求（已脱敏、已截断）。
+//
+// 请求侧字段（RequestBody / RequestContentType / RequestHeaders）是
+// 「能否原样复现该接口」的关键：POST 型列表接口只看响应是推断不出来的。
+// Worker 侧已按白名单过滤请求头，绝不包含 Cookie / Authorization 等凭证。
 type NetworkRecord struct {
-	Seq         int    `json:"seq"`
-	Method      string `json:"method"`
-	URL         string `json:"url"`
-	Status      int    `json:"status"`
-	ContentType string `json:"content_type"`
-	Size        int    `json:"size"`
-	Sample      string `json:"sample"`
-	At          int64  `json:"at"`
+	Seq           int    `json:"seq"`
+	Method        string `json:"method"`
+	URL           string `json:"url"`
+	Status        int    `json:"status"`
+	ContentType   string `json:"content_type"`
+	Size          int    `json:"size"`
+	Sample        string `json:"sample"`
+	FullSample    string `json:"full_sample"`
+	SchemaSummary string `json:"schema_summary"`
+	// RequestBody 请求体片段（GET 为空串）。
+	RequestBody string `json:"request_body"`
+	// RequestContentType 请求的 Content-Type，决定复现时用 JSON 还是 form。
+	RequestContentType string `json:"request_content_type"`
+	// RequestHeaders 请求头白名单快照（不含凭证）。
+	RequestHeaders map[string]string `json:"request_headers"`
+	At             int64             `json:"at"`
 }
 
 // RankedNetworkRecord 是规则打分后的网络候选。
@@ -319,7 +338,7 @@ func (c *Client) ObserveStart(ctx context.Context, taskID string) (int, error) {
 
 // ObserveDiff 返回自 since 以来新增的网络请求与规则打分后的候选。
 // topN 控制候选条数（默认 5），rankedOnly 为 true 时不返回全量请求（省流量）。
-func (c *Client) ObserveDiff(ctx context.Context, taskID string, since, limit, topN int) ([]NetworkRecord, []RankedNetworkRecord, error) {
+func (c *Client) ObserveDiff(ctx context.Context, taskID string, since, limit, topN int) (int, []NetworkRecord, []RankedNetworkRecord, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -339,15 +358,84 @@ func (c *Client) ObserveDiff(ctx context.Context, taskID string, since, limit, t
 		"top_n":       topN,
 		"ranked_only": true,
 	}, &out); err != nil {
-		return nil, nil, err
+		return 0, nil, nil, err
 	}
-	return out.NewRequests, out.Candidates, nil
+	return out.Cursor, out.NewRequests, out.Candidates, nil
+}
+
+// ObserveDiffAll 返回本轮新增的完整网络记录。执行已保存的浏览器动作时，
+// 调用方需要消费页面自身收到的响应，不能再另行复放接口。
+func (c *Client) ObserveDiffAll(ctx context.Context, taskID string, since, limit int) ([]NetworkRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var out struct {
+		NewRequests []NetworkRecord `json:"new_requests"`
+	}
+	if err := c.post(ctx, "/explore/observe-diff", map[string]any{
+		"task_id":     taskID,
+		"since":       since,
+		"limit":       limit,
+		"top_n":       0,
+		"ranked_only": false,
+	}, &out); err != nil {
+		return nil, err
+	}
+	return out.NewRequests, nil
+}
+
+// InspectRequest 按 seq 读取某个已观测网络请求的更大响应片段。
+func (c *Client) InspectRequest(ctx context.Context, taskID string, seq int) (*NetworkRecord, error) {
+	var out struct {
+		Record *NetworkRecord `json:"record"`
+		Error  string         `json:"error"`
+	}
+	if err := c.post(ctx, "/explore/inspect-request", map[string]any{
+		"task_id": taskID,
+		"seq":     seq,
+	}, &out); err != nil {
+		return nil, err
+	}
+	if out.Error != "" {
+		return nil, fmt.Errorf("%w: %s", ErrWorkerRejected, out.Error)
+	}
+	if out.Record == nil {
+		return nil, fmt.Errorf("请求 seq=%d 不存在或已过期", seq)
+	}
+	return out.Record, nil
 }
 
 // Snapshot 读取当前页面的可交互元素与文本片段（只读）。
 func (c *Client) Snapshot(ctx context.Context, taskID string) (*ExploreSnapshot, error) {
 	var out ExploreSnapshot
 	if err := c.post(ctx, "/explore/snapshot", map[string]string{"task_id": taskID}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PageMarkdown 是渲染后页面正文的 Markdown 形式。
+//
+// 存在意义：很多站点的列表接口带鉴权或上下文参数，脱离浏览器无法复现
+// （如快手会返回 code=40014），但页面本身无需登录就渲染出了全部岗位。
+// 读渲染结果因此成为比逆向接口更通用的采集路径。
+type PageMarkdown struct {
+	TaskID     string `json:"task_id"`
+	CurrentURL string `json:"current_url"`
+	Title      string `json:"title"`
+	// Markdown 已脱敏并按上限截断。
+	Markdown string `json:"markdown"`
+	// Truncated 为 true 说明内容超长被截断，调用方可考虑分页处理。
+	Truncated bool `json:"truncated"`
+}
+
+// Markdown 读取当前页面渲染后正文的 Markdown（只读）。
+//
+// 与 ExtractJobs 的区别：ExtractJobs 依赖 Worker 侧写好的站点适配器，
+// 只覆盖已适配站点；本方法不含任何站点知识，对任意站点通用。
+func (c *Client) Markdown(ctx context.Context, taskID string) (*PageMarkdown, error) {
+	var out PageMarkdown
+	if err := c.post(ctx, "/page/markdown", map[string]string{"task_id": taskID}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

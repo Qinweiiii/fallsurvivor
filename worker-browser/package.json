@@ -2,7 +2,7 @@
   "name": "jobos-browser-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "秋招 OS 的 Playwright 辅助填写 Worker。只做表单读取与非敏感字段填写，绝不点击最终提交。",
+  "description": "秋招 OS 的 Playwright 辅助填写与站点探索 Worker。",
   "type": "module",
   "engines": {
     "node": ">=20"

@@ -14,7 +14,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
+	"github.com/eddiel/fallsurvivor/backend/internal/executor"
 	"github.com/eddiel/fallsurvivor/backend/internal/handler/dto"
+	"github.com/eddiel/fallsurvivor/backend/internal/model"
 	"github.com/eddiel/fallsurvivor/backend/internal/repository"
 	searchsvc "github.com/eddiel/fallsurvivor/backend/internal/service/search"
 	"github.com/eddiel/fallsurvivor/backend/internal/source"
@@ -137,11 +139,15 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 	}
 
 	var req struct {
-		URL      string `json:"url"`
-		SiteKey  string `json:"site_key"`
-		Strategy string `json:"strategy"` // auto / script / ai
+		URL     string `json:"url"`
+		SiteKey string `json:"site_key"`
+		// ai 是历史参数，现作为 explore 的别名，避免同类请求进入旧导航器。
+		Strategy string `json:"strategy"` // auto / script / explore / ai(alias)
 		Keyword  string `json:"keyword"`  // 可选搜索关键词（如腾讯校招在列表页搜索框提交）
 		Company  string `json:"company"`  // 可选公司名，用于按公司反查站点 Recipe
+		// SaveAsRecipe 为 true 时，未命中 Recipe 会触发 Exploration Path，
+		// 成功后把探索出的 API 路径保存为站点 Recipe，供下次 Fast Path 复用。
+		SaveAsRecipe bool `json:"save_as_recipe"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.InvalidParam(c, "请求体格式错误")
@@ -155,6 +161,13 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 	if siteKey == "" {
 		siteKey = detectSiteKey(req.URL)
 	}
+	forceExplore := shouldExploreCrawl(req.Strategy, req.SaveAsRecipe)
+	slog.Info("jobs/crawl 路由判定",
+		"site_key", siteKey,
+		"strategy", req.Strategy,
+		"save_as_recipe", req.SaveAsRecipe,
+		"force_explore", forceExplore,
+		"discovery_attached", h.discovery != nil)
 
 	taskID := uuid.NewString()
 
@@ -162,7 +175,7 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 	// 命中已配置站点（如腾讯、字节校招）时，按 Recipe 采集并直接标准化入库，
 	// 绕开联网搜索脏文本的 LLM 解析。未命中则回退到下方通用 AI 导航。
 	// 新增一家公司只需在配置页加一条 Recipe，无需改动本文件。
-	if h.discovery != nil {
+	if h.discovery != nil && !forceExplore {
 		fast, fastErr := h.discovery.FastPath(c.Request.Context(), searchsvc.DiscoveryParams{
 			TaskID:  taskID,
 			SiteKey: siteKey,
@@ -172,51 +185,151 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 		})
 		if fast != nil && fast.Hit {
 			if fastErr != nil {
-				// 命中了 Recipe 但执行失败：给出明确指引（多为未登录）。
-				response.UpstreamFailed(c, "导航爬虫执行失败："+h.crawlHint(fastErr.Error(), siteKey))
+				// 本次真实执行已经证明 Recipe 不可用，立即用同一个用户请求
+				// 重新探索并覆盖旧配置；不先做额外接口验证或盲目重试。
+				forceExplore = true
+				slog.Warn("Recipe Fast Path 失败，转入重新探索", "site_key", siteKey, "error", fastErr.Error())
+			} else {
+				// 同步入库并返回真实诊断：后台 goroutine 会把失败吞掉，
+				// 返回 ingested=len(raws) 只是「投进队列的条数」，库里是否真落库无从得知。
+				opCtx, opCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Minute)
+				defer opCancel()
+				ingestRes, ingestErr := h.svc.IngestRawJobs(opCtx, userID, fast.Jobs)
+				if ingestErr != nil {
+					slog.Warn("Recipe 岗位入库失败", "site_key", siteKey, "error", ingestErr.Error())
+				}
+				var ingested, dup, skipped int
+				var reasons map[string]int
+				if ingestRes != nil {
+					ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
+				}
+				siteName := siteKey
+				company := ""
+				if fast.Recipe != nil {
+					siteName = displayName(fast.Recipe.CompanyName, siteKey)
+					company = fast.Recipe.CompanyName
+				}
+				response.OK(c, gin.H{
+					"site_key":        siteKey,
+					"site_name":       siteName,
+					"company":         company,
+					"count":           fast.JobsFound,
+					"jobs":            jobsFromRaw(fast.Jobs),
+					"strategy":        "站点 Recipe（" + string(fast.Recipe.StrategyType) + "）",
+					"ingested":        ingested,
+					"duplicate":       dup,
+					"skipped":         skipped,
+					"skipped_reasons": reasons,
+					"field_quality":   fast.FieldQuality,
+				})
 				return
 			}
-			// 同步入库并返回真实诊断：后台 goroutine 会把失败吞掉，
-			// 返回 ingested=len(raws) 只是「投进队列的条数」，库里是否真落库无从得知。
-			opCtx, opCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Minute)
-			defer opCancel()
-			ingestRes, ingestErr := h.svc.IngestRawJobs(opCtx, userID, fast.Jobs)
-			if ingestErr != nil {
-				slog.Warn("Recipe 岗位入库失败", "site_key", siteKey, "error", ingestErr.Error())
+		}
+		// 自愈：命中的 Recipe 已被标记失效（连续失败达阈值），
+		// 自动转入探索路径重新摸索，而不是让用户手动去删配置。
+		// 这是「Agent 自己维护采集路径」闭环的最后一环。
+		if fast != nil && fast.NeedsRexplore {
+			forceExplore = true
+			slog.Warn("站点 Recipe 已失效，自动转入重新探索",
+				"site_key", siteKey, "last_error", fast.RexploreReason)
+		}
+		// 未命中 Recipe：默认对非半固定脚本站点转入探索，避免回到旧的通用导航。
+		if shouldAutoExplore(siteKey, req.Strategy) {
+			forceExplore = true
+		}
+	}
+
+	if h.discovery != nil && forceExplore {
+		opCtx, opCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Minute)
+		defer opCancel()
+
+		explored, exploreErr := h.discovery.ExploreSite(opCtx, searchsvc.DiscoveryParams{
+			TaskID:  taskID,
+			SiteKey: siteKey,
+			URL:     req.URL,
+			Company: req.Company,
+			Keyword: req.Keyword,
+		}, req.SaveAsRecipe)
+		if exploreErr != nil {
+			response.UpstreamFailed(c, "站点探索失败："+exploreErr.Error())
+			return
+		}
+		if explored == nil || !explored.Success {
+			reason := "未能生成可复用的站点 Recipe"
+			if explored != nil && explored.Reason != "" {
+				reason = explored.Reason
 			}
-			var ingested, dup, skipped int
-			var reasons map[string]int
-			if ingestRes != nil {
-				ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
+			data := gin.H{}
+			if explored != nil && explored.RunID != "" {
+				data["exploration_run_id"] = explored.RunID
 			}
-			siteName := siteKey
-			company := ""
-			if fast.Recipe != nil {
-				siteName = displayName(fast.Recipe.CompanyName, siteKey)
-				company = fast.Recipe.CompanyName
-			}
+			response.FailWithData(c, http.StatusBadGateway, response.CodeUpstreamFailed, "站点探索失败："+reason, data)
+			return
+		}
+		if !explored.Saved || explored.Recipe == nil {
 			response.OK(c, gin.H{
-				"site_key":        siteKey,
-				"site_name":       siteName,
-				"company":         company,
-				"count":           fast.JobsFound,
-				"jobs":            jobsFromRaw(fast.Jobs),
-				"strategy":        "站点 Recipe（" + string(fast.Recipe.StrategyType) + "）",
-				"ingested":        ingested,
-				"duplicate":       dup,
-				"skipped":         skipped,
-				"skipped_reasons": reasons,
+				"site_key":       siteKey,
+				"site_name":      displayName(req.Company, siteKey),
+				"company":        req.Company,
+				"count":          0,
+				"jobs":           []ai.NavJob{},
+				"strategy":       "站点探索（已验证，未保存 Recipe）",
+				"saved":          false,
+				"trace":          explored.Trace,
+				"candidate":      explored.Candidate,
+				"verified":       explored.Verified,
+				"verified_jobs":  explored.VerifiedJobs,
+				"verify_samples": explored.VerifySampleTitles,
+				"field_quality":  explored.FieldQuality,
+				"refine_rounds":  explored.RefineRounds,
+				"duration_ms":    explored.DurationMS,
 			})
 			return
 		}
-		// 未命中 Recipe：落到下方通用路径。
+		// 首次探索已经拿到了页面真实响应，直接入库；不要求用户再发一次
+		// crawl 才能保存这次已成功获取的数据。
+		ingestRes, ingestErr := h.svc.IngestRawJobs(opCtx, userID, explored.Jobs)
+		if ingestErr != nil {
+			slog.Warn("探索岗位入库失败", "site_key", siteKey, "error", ingestErr.Error())
+		}
+		var ingested, dup, skipped int
+		var reasons map[string]int
+		if ingestRes != nil {
+			ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
+		}
+
+		response.OK(c, gin.H{
+			"site_key":        explored.Recipe.SiteKey,
+			"site_name":       displayName(explored.Recipe.CompanyName, explored.Recipe.SiteKey),
+			"company":         explored.Recipe.CompanyName,
+			"count":           len(explored.Jobs),
+			"jobs":            jobsFromRaw(explored.Jobs),
+			"strategy":        "站点探索（已保存页面动作与本次真实结果）",
+			"recipe_id":       explored.Recipe.ID,
+			"saved":           explored.Saved,
+			"trace":           explored.Trace,
+			"candidate":       explored.Candidate,
+			"ingested":        ingested,
+			"duplicate":       dup,
+			"skipped":         skipped,
+			"skipped_reasons": reasons,
+			"ingest_status":   "completed",
+			"next_action":     "下次调用 crawl 且不传 strategy=explore 时会执行保存的页面动作；失败时自动重新探索并覆盖旧 Recipe。",
+			// 验证信息：让使用者看到「Agent 自己试跑通了，采到了这些岗位」，
+			// 以及为此做了几轮自修正。这是判断探索质量的关键依据。
+			"verified":       explored.Verified,
+			"verified_jobs":  explored.VerifiedJobs,
+			"verify_samples": explored.VerifySampleTitles,
+			"field_quality":  explored.FieldQuality,
+			"refine_rounds":  explored.RefineRounds,
+			"duration_ms":    explored.DurationMS,
+		})
+		return
 	}
 
-	// ---- Discovery Path：通用 AI 导航 ----
-	// 字节跳动 / 腾讯校招走「半固定脚本」：Worker 从官方列表页抽取结构化岗位卡片，
-	// 并抓取详情页 JD 正文，直接标准化入库（绕开联网搜索脏文本）。
-	// 注意：腾讯社招走 careers.tencent.com 官方 API（见 source/tencent.go），本分支仅覆盖校招官网 join.qq.com。
-	if siteKey == "bytedance" || siteKey == "tencent" {
+	// BOSS 当前仍保留可视化详情抓取路径。其他站点（包括腾讯、字节）统一
+	// 通过 Explorer 生成 Recipe，再由通用 Fast Path 执行。
+	if siteKey == "boss" {
 		// 脱离请求上下文：HTTP 服务端超时 / 客户端断开会取消 c.Request.Context()，
 		// 而整个 crawl+入库（含浏览器等待与逐条 LLM 解析）往往耗时数十秒，
 		// 一旦被取消，入库首步的 DB 查询就会报 context canceled 且库里一条都没落。
@@ -227,11 +340,10 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 		var navJobs []ai.NavJob
 		var raws []source.RawJob
 		var crawlErr error
-		if siteKey == "bytedance" {
-			navJobs, raws, crawlErr = h.crawler.CrawlByteDance(opCtx, taskID, req.URL)
-		} else {
-			navJobs, raws, crawlErr = h.crawler.CrawlTencent(opCtx, taskID, req.URL, req.Keyword)
-		}
+		navJobs, raws, crawlErr = h.crawler.CrawlVisibleDetails(
+			opCtx, taskID, "boss", req.URL, req.Keyword,
+			model.SourceBoss, "BOSS直聘", "", 3,
+		)
 		if crawlErr != nil {
 			msg := crawlErr.Error()
 			if strings.Contains(msg, "需要登录") || strings.Contains(msg, "请先登录") {
@@ -261,6 +373,7 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 			"duplicate":       dup,
 			"skipped":         skipped,
 			"skipped_reasons": reasons,
+			"field_quality":   executor.BuildFieldQuality(raws),
 		})
 		return
 	}
@@ -284,6 +397,22 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 		"jobs":      jobs,
 		"strategy":  strategyName(siteKey),
 	})
+}
+
+func shouldExploreCrawl(strategy string, saveAsRecipe bool) bool {
+	strategy = strings.ToLower(strings.TrimSpace(strategy))
+	if saveAsRecipe || strategy == "explore" || strategy == "ai" {
+		return true
+	}
+	return false
+}
+
+func shouldAutoExplore(siteKey, strategy string) bool {
+	strategy = strings.ToLower(strings.TrimSpace(strategy))
+	if strategy != "" && strategy != "auto" {
+		return false
+	}
+	return siteKey != "boss"
 }
 
 // detectSiteKey 按域名推断站点标识，未知站点回退 generic。
@@ -324,6 +453,8 @@ func strategyName(siteKey string) string {
 	switch siteKey {
 	case "tencent", "bytedance":
 		return "半固定脚本（省 token）"
+	case "boss":
+		return "可视化逐详情采集（最多 3 条）"
 	default:
 		return "AI 逐步导航"
 	}
@@ -351,7 +482,34 @@ func displayName(company, siteKey string) string {
 func jobsFromRaw(raws []source.RawJob) []ai.NavJob {
 	out := make([]ai.NavJob, 0, len(raws))
 	for _, r := range raws {
-		out = append(out, ai.NavJob{Title: r.Title, URL: r.URL})
+		out = append(out, ai.NavJob{
+			Title:      r.Title,
+			URL:        r.URL,
+			Department: firstCleanCrawlMeta(r.Meta["Department"], r.Meta["Business"]),
+		})
 	}
 	return out
+}
+
+func jobsFromTitles(titles []string) []ai.NavJob {
+	out := make([]ai.NavJob, 0, len(titles))
+	for _, title := range titles {
+		if t := strings.TrimSpace(title); t != "" {
+			out = append(out, ai.NavJob{Title: t})
+		}
+	}
+	return out
+}
+
+func firstCleanCrawlMeta(values ...string) string {
+	for _, v := range values {
+		t := strings.TrimSpace(v)
+		switch strings.ToLower(t) {
+		case "", "<nil>", "nil", "null", "undefined":
+			continue
+		default:
+			return t
+		}
+	}
+	return ""
 }

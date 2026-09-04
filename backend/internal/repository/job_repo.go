@@ -252,7 +252,7 @@ func (r *JobRepo) UpdateEnrichment(ctx context.Context, id model.ID, fields map[
 		"department": true, "business": true, "location": true, "locations": true,
 		"job_type": true, "graduation_year": true, "description": true,
 		"responsibilities": true, "requirements": true, "language_requirements": true,
-		"technical_stack": true, "official_url": true, "published_at": true,
+		"technical_stack": true, "source_url": true, "official_url": true, "published_at": true,
 		"deadline": true, "crawled_at": true, "match_score": true, "match_analysis": true,
 		"desc_quality": true,
 	}

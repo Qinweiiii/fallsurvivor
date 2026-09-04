@@ -60,7 +60,8 @@ const BODY_POSITIVE = [
   { re: /"postId"|"jobId"|"positionId"/i, score: 25, why: '响应含岗位 ID' },
   { re: /"jobName"|"positionName"|"positionTitle"|"jobTitle"/i, score: 25, why: '响应含岗位标题' },
   { re: /"cityName"|"workCity"|"location"/i, score: 12, why: '响应含城市字段' },
-  { re: /"requirement"|"responsibilit|"description"/i, score: 14, why: '响应含 JD 字段' },
+  { re: /"requirement"|"responsibilit|"description"|"workContent"|"work_content"/i, score: 18, why: '响应含 JD/工作内容字段' },
+  { re: /"qualification"|"duty"|"workDuty"|"jobDuty"/i, score: 12, why: '响应含职责/资格字段' },
 ];
 
 /** 合理的岗位列表响应体积区间（字节）。 */
@@ -110,10 +111,15 @@ export function scoreRequest(req: ObservedRequest): RankedRequest {
 
   // 响应体字段名。
   for (const p of BODY_POSITIVE) {
-    if (p.re.test(req.sample)) {
+    if (p.re.test(`${req.sample}\n${req.schemaSummary}`)) {
       score += p.score;
       reasons.push(p.why);
     }
+  }
+
+  if (/array\[\d+\]\s+item\{[^}]*?(job|position|post|title|name)/i.test(req.schemaSummary)) {
+    score += 16;
+    reasons.push('结构摘要显示疑似岗位数组');
   }
 
   // 体积合理性。
@@ -129,6 +135,26 @@ export function scoreRequest(req: ObservedRequest): RankedRequest {
   if (req.method.toUpperCase() === 'POST') {
     score += 6;
     reasons.push('POST 查询请求');
+  }
+
+  // 请求体线索：POST 型列表接口的复现关键。
+  //
+  // 记录并加分的意义在于——只有拿到请求体，Agent 才能自己判断
+  // 「该发 JSON 还是 form」「要带哪些查询字段」，而不必靠人工试错补分支。
+  if (req.requestBody) {
+    if (/page|pageNo|pageSize|current|limit|offset/i.test(req.requestBody)) {
+      score += 14;
+      reasons.push('请求体含分页参数，疑似列表查询');
+    }
+    if (/keyword|key_?word|query|search|title|name/i.test(req.requestBody)) {
+      score += 12;
+      reasons.push('请求体含关键词参数，疑似搜索接口');
+    }
+    if (req.requestContentType.includes('json')) {
+      reasons.push('请求体为 JSON');
+    } else if (req.requestContentType.includes('form')) {
+      reasons.push('请求体为表单');
+    }
   }
 
   return { request: req, score, reasons };
