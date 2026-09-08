@@ -37,7 +37,13 @@ export interface JobProfile {
 // ---------------- 岗位 ----------------
 
 export type JobStatus = 'NEW' | 'IN_CART' | 'PREPARING' | 'SUBMITTED' | 'CLOSED';
-export type SourceType = 'OFFICIAL' | 'BOSS' | 'TAVILY' | 'MANUAL';
+export type SourceType = 'OFFICIAL' | 'BOSS' | 'TAVILY' | 'MANUAL' | 'BROWSER';
+export type JobEnrichmentStatus =
+  | 'none'
+  | 'pending_enrichment'
+  | 'enriching'
+  | 'enriched'
+  | 'enrich_failed';
 
 export interface MatchAnalysis {
   score?: number;
@@ -74,6 +80,9 @@ export interface Job {
   crawled_at: string;
   match_score: number;
   match_analysis: MatchAnalysis;
+  enrichment_status: JobEnrichmentStatus;
+  enrichment_error: string;
+  enrichment_updated_at: string | null;
   status: JobStatus;
   created_at: string;
   updated_at: string;

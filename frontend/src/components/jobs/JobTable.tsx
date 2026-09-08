@@ -1,10 +1,10 @@
 'use client';
 
-import { Badge, jobStatusToneOf } from '@/components/ui/Badge';
+import { Badge, enrichmentStatusToneOf, jobStatusToneOf } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { MatchBadge } from './MatchBadge';
 import { EmptyState, TableSkeleton } from '@/components/ui/States';
-import { cn, firstDisplayValue, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
+import { cn, ENRICHMENT_STATUS_LABELS, firstDisplayValue, JOB_STATUS_LABELS, orDash } from '@/lib/utils';
 import type { Job } from '@/lib/types';
 
 interface JobTableProps {
@@ -117,6 +117,13 @@ export function JobTable({
                       JD 不完整
                     </span>
                   )}
+                  {job.enrichment_status && job.enrichment_status !== 'none' ? (
+                    <span className="ml-1.5 align-middle" title={job.enrichment_error || undefined}>
+                      <Badge tone={enrichmentStatusToneOf(job.enrichment_status)}>
+                        {ENRICHMENT_STATUS_LABELS[job.enrichment_status] ?? job.enrichment_status}
+                      </Badge>
+                    </span>
+                  ) : null}
                 </td>
 
                 <td className="td text-ink-600">{orDash(job.location)}</td>

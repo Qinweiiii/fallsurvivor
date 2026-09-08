@@ -4,6 +4,8 @@ package router
 import (
 	"context"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -11,6 +13,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/eddiel/fallsurvivor/backend/config"
+	"github.com/eddiel/fallsurvivor/backend/internal/agent"
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
 	"github.com/eddiel/fallsurvivor/backend/internal/browser"
 	"github.com/eddiel/fallsurvivor/backend/internal/handler"
@@ -96,6 +99,14 @@ func BuildServices(cfg *config.Config, store *repository.Store, enqueuer *asynq.
 	// 只在 Fast Path 未命中时启用：自动探索未知站点的采集方式，
 	// 产出候选并可保存为新 Recipe，使下次直接走 Fast Path。
 	discovery.AttachExplorer(searchsvc.NewExplorer(browserClient, llm, store.Site.Inner()))
+
+	// ---- Option B：Python 探索 Agent 微服务（可选、可灰度）----
+	// 设置 AGENT_EXPLORER_URL 即装配客户端；USE_PYTHON_AGENT=true 才真正切到 Python，
+	// 否则（默认）完全走 Go 内置 Explorer，行为与改动前一致。双向校验复用 BROWSER_WORKER_TOKEN。
+	if agentURL := strings.TrimSpace(os.Getenv("AGENT_EXPLORER_URL")); agentURL != "" {
+		usePython := strings.EqualFold(os.Getenv("USE_PYTHON_AGENT"), "true")
+		discovery.AttachAgentExplorer(agent.New(agentURL, cfg.BrowserWorkerToken), usePython)
+	}
 
 	// ---- JD 补全服务 ----
 	// BOSS 等站点受反爬限制只能拿到摘要，这里复用用户已登录的浏览器会话

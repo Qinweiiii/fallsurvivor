@@ -69,7 +69,7 @@ func run() error {
 	})
 
 	mux := asynq.NewServeMux()
-	task.NewHandler(svcs.Pipeline).Register(mux)
+	task.NewHandler(svcs.Pipeline, svcs.Enrichment).Register(mux)
 
 	// 支持优雅退出。
 	go func() {

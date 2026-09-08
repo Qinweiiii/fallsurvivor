@@ -67,6 +67,20 @@ export function jobStatusToneOf(status: string): Tone {
   return jobStatusTone[status] ?? 'neutral';
 }
 
+export function enrichmentStatusToneOf(status: string): Tone {
+  switch (status) {
+    case 'pending_enrichment':
+    case 'enriching':
+      return 'cream';
+    case 'enriched':
+      return 'mint';
+    case 'enrich_failed':
+      return 'blossom';
+    default:
+      return 'neutral';
+  }
+}
+
 export function appStatusToneOf(status: string): Tone {
   return appStatusTone[status] ?? 'neutral';
 }

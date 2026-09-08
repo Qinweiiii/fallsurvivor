@@ -169,8 +169,11 @@ const (
 	RunSuccess RunStatus = "success"
 	// RunEmpty 执行成功但没有采集到任何岗位（可能是筛选条件过窄或页面结构变化）。
 	RunEmpty RunStatus = "empty"
-	// RunFailed 执行过程中出错。
+	// RunFailed 执行过程中出错（与配置相关的真实失败，计入连续失败）。
 	RunFailed RunStatus = "failed"
+	// RunEnvironment 执行因环境故障（Worker 未启动 / 登录过期）而失败，
+	// 与 Recipe 配置无关，只记录执行历史、不计入连续失败、不触发失效。
+	RunEnvironment RunStatus = "environment"
 )
 
 // Run 记录 Recipe 的一次执行结果，用于观测与后续 Reflection。

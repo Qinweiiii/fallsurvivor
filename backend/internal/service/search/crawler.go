@@ -37,51 +37,12 @@ func NewSiteCrawler(b *browser.Client, llm *ai.Client) *SiteCrawler {
 	return &SiteCrawler{browser: b, llm: llm}
 }
 
-// Crawl 从 startURL 开始多步导航，返回发现的岗位入口。
-// taskID 用于复用 Worker 会话（同一 taskID 复用已打开的浏览器窗口与登录态）。
-// strategy 可选："auto"（默认）、"script"（仅保留给腾讯旧脚本调试）。
-//
-// 未知站点的多步探索由 Explorer 负责。这里不再保留另一套基于全文抓取的
-// AI 导航器，否则同一个请求会因 strategy 不同走出两套不可比较的行为。
-func (c *SiteCrawler) Crawl(ctx context.Context, taskID, siteKey, startURL, strategy string) ([]ai.NavJob, error) {
-	// 旧腾讯脚本不再按 siteKey 自动触发；只有显式调试参数才可调用，
-	// 正常请求统一经 Explorer / Recipe。
-	if strategy == "script" {
-		if siteKey != "tencent" {
-			return nil, fmt.Errorf("script 策略当前仅保留给腾讯旧链路调试")
-		}
-		slog.Info("使用腾讯半固定导航策略", "task_id", taskID)
-		_, raws, err := c.CrawlTencent(ctx, taskID, startURL, "")
-		if err != nil {
-			return nil, err
-		}
-		// Crawl 仅返回导航入口，落库在 handler 的专用分支完成。
-		navJobs := make([]ai.NavJob, 0, len(raws))
-		for _, r := range raws {
-			navJobs = append(navJobs, ai.NavJob{Title: r.Title, URL: r.URL})
-		}
-		return navJobs, nil
-	}
-
-	return nil, fmt.Errorf("未知站点必须通过 Exploration Agent 探索，请使用 strategy=explore")
-}
-
 // defaultMaxDetailFetches 是站点 Recipe 未配置 max_detail_fetches 时的兜底值，
 // 限制每个列表页额外抓取详情页 JD 的岗位数，避免浏览器会话耗时过长。
 const defaultMaxDetailFetches = 8
 
-// CrawlByteDance 使用字节跳动招聘的半固定脚本：
-//  1. 打开列表页（URL 已带关键词）；
-//  2. 滚动若干次以触发无限分页加载；
-//  3. 直接从 DOM 抽取结构化岗位卡片（URL + 标题），绕开 LLM 对联网搜索脏文本的解析；
-//  4. 对前 N 个卡片打开详情页抓取 JD 正文，连同权威 Meta（公司=字节跳动）一起返回，
-//     供 pipeline 标准化入库，从而消除 Tavily 联网搜索带来的噪声。
-//
-// 返回 (展示用岗位入口, 待入库的结构化原始岗位, error)。
-// crawlExtractJobs 通用浏览器抽卡落库流程：打开站点 → 滚动加载 → 抽取卡片 → 逐个打开详情页抓取 JD。
-// siteKey 决定 Worker 侧使用哪个抽取适配器；company/companyHint/sourceName 用于落库标识。
-// keyword 为可选搜索关键词（目前仅腾讯校招使用），非空时由 Worker 在列表页搜索框提交后抽取过滤结果。
-// 字节校招（jobs.bytedance.com/campus）与腾讯校招（join.qq.com）共用本流程，仅入口与适配器不同。
+// crawlExtractJobs 是 Recipe 驱动的浏览器抽卡流程：打开站点、加载列表、抽取卡片。
+// siteKey/adapter、company、sourceName、keyword 全部由 Recipe 或请求传入，不按公司硬编码分流。
 //
 // maxDetailFetches 控制「对多少条岗位打开详情页抓 JD」，由站点 Recipe 提供：
 //   - <= 0：完全跳过详情页抓取，直接用 card.RawText 落库。
@@ -188,12 +149,6 @@ func (c *SiteCrawler) crawlExtractJobs(ctx context.Context, taskID, siteKey, sta
 	return navJobs, raws, nil
 }
 
-// CrawlByteDance 保留为字节站点的便捷入口，默认走详情页抓取。
-// 新的调用方应优先使用 CrawlWithRecipe（由站点 Recipe 驱动）。
-func (c *SiteCrawler) CrawlByteDance(ctx context.Context, taskID, startURL string) ([]ai.NavJob, []source.RawJob, error) {
-	return c.crawlExtractJobs(ctx, taskID, "bytedance", startURL, "字节跳动", "字节跳动招聘", "", defaultMaxDetailFetches)
-}
-
 // CrawlWithRecipe 按站点 Recipe 执行一次浏览器采集。
 //
 // 这是「数据驱动采集」的统一入口：全部参数从 Recipe 读取，
@@ -265,12 +220,18 @@ func (c *SiteCrawler) crawlBrowserObserved(ctx context.Context, taskID string, r
 	if siteKey == "" {
 		siteKey = "generic"
 	}
-	if _, err := c.browser.OpenSession(ctx, browser.SessionRequest{
+	sess, err := c.browser.OpenSession(ctx, browser.SessionRequest{
 		TaskID:  taskID,
 		SiteKey: siteKey,
 		URL:     entry,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("browser_observed: 打开会话失败: %w", err)
+	}
+	// 登录态过期是环境故障，不是 Recipe 配置错误：直接透传给上层，
+	// 不应计入连续失败、不应把一条好配置废掉。
+	if sess.NeedsLogin {
+		return nil, browser.ErrLoginExpired
 	}
 	defer func() {
 		_ = c.browser.CloseSession(ctx, taskID)
@@ -304,44 +265,10 @@ func (c *SiteCrawler) crawlBrowserObserved(ctx context.Context, taskID string, r
 		if rc.MaxJobsPerSearch > 0 && len(jobs) > rc.MaxJobsPerSearch {
 			jobs = jobs[:rc.MaxJobsPerSearch]
 		}
-		c.enrichBrowserObservedDetails(ctx, taskID, rc, jobs)
 		slog.Info("browser_observed 使用页面真实响应解析岗位", "site_key", rc.SiteKey, "jobs", len(jobs))
 		return jobs, nil
 	}
 	return nil, fmt.Errorf("browser_observed: 页面动作后未观测到可解析的岗位列表响应")
-}
-
-// enrichBrowserObservedDetails 只访问已由 Recipe 的实测模板生成的同站详情页。
-// 单页失败不否定列表路径，保留列表结果并等待下次正常请求重新探索或更新 Recipe。
-func (c *SiteCrawler) enrichBrowserObservedDetails(ctx context.Context, taskID string, rc *site.Recipe, jobs []source.RawJob) {
-	if rc == nil || strings.TrimSpace(rc.DetailURLTemplate) == "" || rc.MaxDetailFetches <= 0 {
-		return
-	}
-	limit := rc.MaxDetailFetches
-	if limit > len(jobs) {
-		limit = len(jobs)
-	}
-	entryHost := hostOf(rc.CampusURL)
-	for i := 0; i < limit; i++ {
-		if jobs[i].URL == "" || (entryHost != "" && !strings.EqualFold(hostOf(jobs[i].URL), entryHost)) {
-			continue
-		}
-		resp, err := c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavNavigate, URL: jobs[i].URL})
-		if err != nil || !resp.OK {
-			continue
-		}
-		_, _ = c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: exploreWaitAfterAction})
-		page, err := c.browser.ScrapePage(ctx, taskID)
-		if err != nil || page == nil || page.NeedsLogin {
-			continue
-		}
-		content, quality := DetectDescriptionQuality(page.PageText)
-		if quality == DescQualityEmpty {
-			continue
-		}
-		jobs[i].Content = content
-		jobs[i].Snippet = truncateForLog(content, 500)
-	}
 }
 
 func sameAPIPath(a, b string) bool {
@@ -353,9 +280,13 @@ func sameAPIPath(a, b string) bool {
 	return strings.EqualFold(au.Host, bu.Host) && au.Path == bu.Path
 }
 
+func (c *SiteCrawler) runBrowserPlan(ctx context.Context, taskID string, plan model.JSONMap, keyword string) error {
+	return runBrowserPlan(ctx, c.browser, taskID, plan, keyword, "browser_observed")
+}
+
 // runBrowserPlan 只执行可跨会话复用的语义动作。DOM ref 是单个页面实例的临时
 // 标识，保存它会让下次任务天然失效，因此这里刻意不支持。
-func (c *SiteCrawler) runBrowserPlan(ctx context.Context, taskID string, plan model.JSONMap, keyword string) error {
+func runBrowserPlan(ctx context.Context, bc *browser.Client, taskID string, plan model.JSONMap, keyword, errPrefix string) error {
 	actions, _ := plan["actions"].([]any)
 	ranSearch := false
 	for _, raw := range actions {
@@ -387,21 +318,21 @@ func (c *SiteCrawler) runBrowserPlan(ctx context.Context, taskID string, plan mo
 		default:
 			continue
 		}
-		resp, err := c.browser.NavAct(ctx, taskID, nav)
+		resp, err := bc.NavAct(ctx, taskID, nav)
 		if err != nil || !resp.OK {
 			if err != nil {
-				return fmt.Errorf("browser_observed: 动作 %s 失败: %w", kind, err)
+				return fmt.Errorf("%s: 动作 %s 失败: %w", errPrefix, kind, err)
 			}
-			return fmt.Errorf("browser_observed: 动作 %s 未完成: %s", kind, resp.Message)
+			return fmt.Errorf("%s: 动作 %s 未完成: %s", errPrefix, kind, resp.Message)
 		}
 	}
 	if !ranSearch && strings.TrimSpace(keyword) != "" {
-		resp, err := c.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavSearch, Keyword: keyword})
+		resp, err := bc.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavSearch, Keyword: keyword})
 		if err != nil || !resp.OK {
 			if err != nil {
-				return fmt.Errorf("browser_observed: 搜索失败: %w", err)
+				return fmt.Errorf("%s: 搜索失败: %w", errPrefix, err)
 			}
-			return fmt.Errorf("browser_observed: 搜索未完成: %s", resp.Message)
+			return fmt.Errorf("%s: 搜索未完成: %s", errPrefix, resp.Message)
 		}
 	}
 	return nil

@@ -130,7 +130,7 @@ func loadLLMConfig() LLMConfig {
 		return LLMConfig{
 			APIKey:  key,
 			BaseURL: getEnv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-			Model:   getEnv("QWEN_MODEL", "glm-5.2"),
+			Model:   getEnv("QWEN_MODEL", "deepseek-v4-flash-0731"),
 			Timeout: getEnvSeconds("QWEN_TIMEOUT_SECONDS", 90*time.Second, 5*time.Minute),
 		}
 	}

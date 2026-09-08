@@ -15,6 +15,15 @@ export const JOB_STATUS_LABELS: Record<string, string> = {
   CLOSED: '已结束',
 };
 
+/** JD 补全状态的中文名。 */
+export const ENRICHMENT_STATUS_LABELS: Record<string, string> = {
+  none: '未补全',
+  pending_enrichment: '待补全',
+  enriching: '补全中',
+  enriched: '已补全',
+  enrich_failed: '补全失败',
+};
+
 /** 投递状态的中文名。 */
 export const APP_STATUS_LABELS: Record<string, string> = {
   PREPARING: '待准备',

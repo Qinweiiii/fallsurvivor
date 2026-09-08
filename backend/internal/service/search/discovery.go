@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/eddiel/fallsurvivor/backend/internal/agent"
 	"github.com/eddiel/fallsurvivor/backend/internal/ai"
 	"github.com/eddiel/fallsurvivor/backend/internal/executor"
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
@@ -28,6 +29,20 @@ type DiscoveryService struct {
 	registry *site.Registry
 	executor *executor.Executor
 	explorer *Explorer
+
+	// agentClient 与 usePythonAgent 实现 Option B：把探索交给 Python Agent 微服务。
+	// 二者由 AttachAgentExplorer 注入；usePythonAgent 为 false 时完全走原 Go 探索，
+	// 保证双实现并存、可一键回退（见 docs/AGENT_PYTHON_DESIGN.md 第 7 节）。
+	agentClient    *agent.Client
+	usePythonAgent bool
+}
+
+// AttachAgentExplorer 注入 Python 探索 Agent 客户端，并指定是否启用。
+// use=true 时 Discovery Path 改为调用 Python 服务（其探索循环自带验证）；
+// use=false（默认）时行为与改动前完全一致，回退到 Go 内置 Explorer。
+func (d *DiscoveryService) AttachAgentExplorer(c *agent.Client, use bool) {
+	d.agentClient = c
+	d.usePythonAgent = use
 }
 
 // NewDiscoveryService 构造发现服务。
@@ -190,6 +205,10 @@ type ExploreSiteResult struct {
 // Registry，使该站点下次直接走 Fast Path。
 // 未通过验证的配置不会落库——落一条跑不通的配置只会制造后续排查成本。
 func (d *DiscoveryService) ExploreSite(ctx context.Context, p DiscoveryParams, saveAsRecipe bool) (*ExploreSiteResult, error) {
+	// Option B：启用 Python 探索 Agent 时，把探索交给独立微服务（其循环自带验证）。
+	if d.usePythonAgent && d.agentClient != nil {
+		return d.exploreViaPython(ctx, p, saveAsRecipe)
+	}
 	if d.explorer == nil {
 		return &ExploreSiteResult{Reason: "未启用探索能力"}, nil
 	}
@@ -245,7 +264,7 @@ func (d *DiscoveryService) ExploreSite(ctx context.Context, p DiscoveryParams, s
 
 	// 只有验证通过的配置才落库。
 	if saveAsRecipe && d.registry != nil {
-		rc, err := saveExploredRecipe(ctx, d.registry, p, cand, verify, browserObservedEntryURL(p.URL, res.Trace), browserPlanFromTrace(res.Trace))
+		rc, err := saveExploredRecipe(ctx, d.registry, p, cand, verify, browserObservedEntryURL(p.URL, res.Trace), browserPlanFromTrace(res.Trace), d.executor.ProbeDirectFetch)
 		if err != nil {
 			slog.Warn("保存探索结果失败", "site_key", p.SiteKey, "error", err.Error())
 			out.Reason = "探索成功但保存失败: " + err.Error()
@@ -259,8 +278,10 @@ func (d *DiscoveryService) ExploreSite(ctx context.Context, p DiscoveryParams, s
 
 // saveExploredRecipe 把**已验证通过**的候选保存为站点 Recipe 并重载 Registry。
 //
-// 保存的 Recipe strategy_type 为 api：探索阶段已经找到并验证了岗位列表接口，
-// 后续搜索应复用这条稳定路径，而不是每次重新打开浏览器探索。
+// 保存策略由「落库前探测 deeppath」决定，而非硬编码 api：
+//   - 浏览器动作计划（browser_plan）始终保存——它是 api 失败时的稳定回退；
+//   - 能直连 curl 出岗位 → api（最快）；否则 → browser_observed（重放真实页面动作）。
+// 这样 api 被反爬拦截时不会误判为配置错误，也不会因此退回重探（烧 token）。
 //
 // 同时写入健康度字段（verify_status / verified_jobs / verified_at），
 // 让后续的失效自愈逻辑有判断依据。
@@ -272,6 +293,7 @@ func saveExploredRecipe(
 	verify executor.VerifyResult,
 	entryURL string,
 	browserPlan model.JSONMap,
+	prober func(context.Context, *site.Recipe) (bool, error),
 ) (*site.Recipe, error) {
 	repo := reg.Repository()
 	if repo == nil {
@@ -282,9 +304,29 @@ func saveExploredRecipe(
 	if strings.TrimSpace(draft.DetailURLTemplate) != "" {
 		draft.MaxDetailFetches = defaultMaxDetailFetches
 	}
-	if verify.BrowserBound {
+	// 浏览器动作计划始终保存：它是 api 失败时的稳定回退（重放真实页面动作），
+	// 也保证后续 Fast Path 在 api 被反爬拦截时可无损降级到 browser_observed。
+	if browserPlan == nil {
+		browserPlan = defaultBrowserPlan(entryURL)
+	} else {
+		browserPlan = ensureNavigate(browserPlan, entryURL)
+	}
+	draft.BrowserPlan = browserPlan
+
+	// 落库前探测 deeppath：能直连 curl 出岗位 → api；否则 browser_observed。
+	// 用户要求的关键环节：api 失败往往只是反爬拦截，不代表配置错误，
+	// 因此不能把 api 当默认策略，也不能因 api 失败就回退去重探（烧 token）。
+	if prober != nil {
+		if ok, perr := prober(ctx, draft); perr == nil && ok {
+			draft.StrategyType = site.StrategyAPI
+			if !strings.Contains(draft.Notes, "接口") {
+				draft.Notes = strings.TrimSpace(draft.Notes + "；可直接复放接口，并保存页面动作作为回退")
+			}
+		} else {
+			draft.StrategyType = site.StrategyBrowserObserved
+		}
+	} else {
 		draft.StrategyType = site.StrategyBrowserObserved
-		draft.BrowserPlan = browserPlan
 	}
 	if strings.TrimSpace(entryURL) != "" {
 		draft.CampusURL = strings.TrimSpace(entryURL)
@@ -295,7 +337,7 @@ func saveExploredRecipe(
 	if draft.Notes = strings.TrimSpace(cand.Notes); draft.Notes == "" {
 		draft.Notes = "由 Exploration Agent 自动探索并验证通过"
 	}
-	if verify.BrowserBound && !strings.Contains(draft.Notes, "页面动作") {
+	if draft.StrategyType == site.StrategyBrowserObserved && !strings.Contains(draft.Notes, "页面动作") {
 		draft.Notes = strings.TrimSpace(draft.Notes + "；保存页面动作并解析页面真实响应，不直接复放接口")
 	}
 	applyVerifyResult(draft, verify)
@@ -331,6 +373,42 @@ func saveExploredRecipe(
 		return nil, err
 	}
 	return draft, nil
+}
+
+// defaultBrowserPlan 生成兜底浏览器动作计划：先 navigate 到入口页，再由其后的
+// 探索动作（search 等）驱动站点自身请求。
+func defaultBrowserPlan(entryURL string) model.JSONMap {
+	return model.JSONMap{"actions": []any{
+		map[string]any{"type": "navigate", "url": entryURL},
+	}}
+}
+
+// ensureNavigate 保证动作计划里至少有一个 navigate 入口：若没有，则前置一个
+// navigate 到入口页，避免运行时没有页面起点。
+func ensureNavigate(plan model.JSONMap, entryURL string) model.JSONMap {
+	actions, ok := plan["actions"].([]any)
+	if !ok || len(actions) == 0 {
+		return defaultBrowserPlan(entryURL)
+	}
+	for _, a := range actions {
+		if m, ok := a.(map[string]any); ok {
+			if t, _ := m["type"].(string); t == "navigate" {
+				return plan
+			}
+		}
+	}
+	return model.JSONMap{"actions": append([]any{map[string]any{"type": "navigate", "url": entryURL}}, actions...)}
+}
+
+// ExecuteRecipe 用指定 Recipe 直接执行一次采集。
+// 供 Fast Path 的 api → browser_observed 降级重试复用：当 api 被反爬拦截时，
+// 用同一份浏览器动作计划重放，而不是退回重探（避免烧 token）。
+func (d *DiscoveryService) ExecuteRecipe(ctx context.Context, rc *site.Recipe, keyword, taskID string) ([]source.RawJob, error) {
+	res, err := d.executor.Execute(ctx, executor.Params{Recipe: rc, Keyword: keyword, TaskID: taskID})
+	if err != nil {
+		return nil, err
+	}
+	return res.Jobs, nil
 }
 
 func browserObservedEntryURL(original string, trace []ExploreStepTrace) string {

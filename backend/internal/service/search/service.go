@@ -88,12 +88,43 @@ func (s *Service) GetLatest(ctx context.Context, userID model.ID) (*model.Search
 	return s.store.SearchTask.GetLatest(ctx, userID)
 }
 
-// IngestRawJobs 把已结构化的原始岗位（如浏览器半固定脚本抽取的结果）直接走
+// IngestRawJobs 把已结构化的原始岗位（如浏览器 Recipe/探索抽取的结果）直接走
 // 去重 + 标准化 + LLM 解析流程入库，绕开联网搜索的脏文本。
 //
-// 用于「B 沉淀策略」的浏览器脚本：Worker 已从官方列表页抽取出真实岗位链接与
-// JD 正文，这里复用 pipeline 的标准化能力，让字节跳动等需要浏览器的站点也能
-// 产出干净、字段准确的结构化岗位记录。
+// 用于站点 Recipe 和首次探索：Worker 已从官方列表页拿到真实岗位数据，
+// 这里复用 pipeline 的标准化能力；缺少完整 JD 的记录会进入异步补全。
 func (s *Service) IngestRawJobs(ctx context.Context, userID model.ID, raws []source.RawJob) (*IngestResult, error) {
 	return s.pipeline.IngestRawJobs(ctx, userID, raws)
+}
+
+// EnqueueEnrichment 派发 JD 补全任务。没有待补全岗位时直接返回 0。
+func (s *Service) EnqueueEnrichment(ctx context.Context, userID model.ID, jobIDs []model.ID, maxJobs int, keyword string) (int, error) {
+	if len(jobIDs) == 0 {
+		return 0, nil
+	}
+	rawIDs := make([]string, 0, len(jobIDs))
+	seen := map[string]bool{}
+	for _, id := range jobIDs {
+		if id == (model.ID{}) {
+			continue
+		}
+		key := id.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		rawIDs = append(rawIDs, key)
+	}
+	if len(rawIDs) == 0 {
+		return 0, nil
+	}
+	asynqTask, err := task.NewJobEnrichJDTask(userID.String(), rawIDs, maxJobs, keyword)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.enqueuer.EnqueueContext(ctx, asynqTask); err != nil {
+		return 0, err
+	}
+	slog.Info("已派发 JD 补全任务", "jobs", len(rawIDs))
+	return len(rawIDs), nil
 }

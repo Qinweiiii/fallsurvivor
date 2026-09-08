@@ -56,6 +56,27 @@ func (e *Executor) executeAPI(ctx context.Context, p Params) ([]source.RawJob, e
  * 抽成同一函数（而不是验证时再发一次请求）避免了重复请求：
  * 同一份响应既用于解析岗位，也用于诊断。
  */
+// ProbeDirectFetch 落库前探测：用 safefetch 直连 ListAPI 看能否独立采到岗位。
+//
+// 能 → Fast Path 后续可走 api；不能（被反爬拦截 / 站点改版）→ 应走 browser_observed。
+// 这是用户要求的关键环节——api 失败往往只是反爬拦截，不代表配置错误，
+// 因此不能把 api 当默认策略，也不能因 api 失败就回退去重探（浪费 token）。
+//
+// 用多个兜底关键词试放，避免把“当前关键词无岗位”误判为“接口不可用”。
+// 仅用于决定保存策略：不落库、不计入健康度、不写 recipe_runs。
+func (e *Executor) ProbeDirectFetch(ctx context.Context, rc *site.Recipe) (bool, error) {
+	if e.fetcher == nil {
+		return false, fmt.Errorf("API 采集器未初始化，跳过探测")
+	}
+	for _, kw := range []string{"", "工程师", "校招", "实习"} {
+		jobs, _, err := e.executeAPIWithDiag(ctx, Params{Recipe: rc, Keyword: kw})
+		if err == nil && len(jobs) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (e *Executor) executeAPIWithDiag(ctx context.Context, p Params) ([]source.RawJob, string, error) {
 	rc := p.Recipe
 	if e.fetcher == nil {

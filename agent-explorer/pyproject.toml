@@ -1,0 +1,27 @@
+[project]
+name = "fallsurvivor-agent-explorer"
+version = "0.1.0"
+description = "探索 Agent 微服务：LangGraph 多角色编排 + browser-use 控浏览器（Option B）"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+    # langgraph 锁 0.2 线：1.x 要求 langchain-core>=1.4，而 browser-use 0.1.x 要求
+    # langchain-core==0.3.49，两者冲突。0.2 线接口（StateGraph/add_node/compile 等）完全一致。
+    "langgraph~=0.2.0",
+    "langchain-core==0.3.49",   # 必须与 browser-use 0.1.48 的精确 pin 对齐
+    "langchain-openai>=0.3,<0.4",
+    "httpx>=0.27",              # FastAPI TestClient 依赖
+    # browser-use 是正式实现 Actor 时的浏览器控制依赖。
+    # 注意：它会被 pip 安装进【本服务的 venv】，不是引用项目根目录下的 ./browser-use
+    # 本地克隆（那个文件夹仅供阅读、后续会删除）。所有 browser-use 使用代码写在
+    # agent-explorer/app/browser/controller.py，详见 docs/AGENT_PYTHON_DESIGN.md。
+    "browser-use==0.1.48",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

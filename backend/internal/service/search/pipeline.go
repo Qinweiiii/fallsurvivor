@@ -215,7 +215,7 @@ func (p *Pipeline) run(ctx context.Context, task *model.SearchTask) (*RunResult,
 	for i := range candidates {
 		c := candidates[i]
 		g.Go(func() error {
-			created, score, _, err := p.processCandidate(gctx, task.UserID, c, profile, cityScores, resumeBrief, false)
+			created, _, score, _, _, err := p.processCandidate(gctx, task.UserID, c, profile, cityScores, resumeBrief, false)
 			if err != nil {
 				// 单条失败不影响整体。
 				slog.Warn("处理岗位候选失败", "url", c.NormalizedURL, "error", err.Error())
@@ -381,11 +381,13 @@ type IngestResult struct {
 	Skipped int `json:"skipped"`
 	// SkippedReasons 按跳过原因聚合计数，便于定位噪声来源。
 	SkippedReasons map[string]int `json:"skipped_reasons"`
+	// PendingEnrichmentIDs 已落库但缺少完整职责/要求、需要异步补全详情的岗位。
+	PendingEnrichmentIDs []model.ID `json:"pending_enrichment_ids"`
 }
 
-// IngestRawJobs 处理已由外部（如浏览器半固定脚本）结构化的原始岗位：
-// 批内去重 → 逐条丰富 + 评分 + 落库。复用了 Run 的核心步骤 4~6，
-// 让字节跳动这类需要浏览器的站点也能产出干净、字段准确的结构化岗位记录。
+// IngestRawJobs 处理已由浏览器 Recipe 或探索流程结构化的原始岗位：
+// 批内去重 → 逐条解析 → 可评分则评分 → 落库。缺少完整 JD 的岗位会先入库，
+// 再交给异步补全流程尝试进入详情页补职责/要求。
 func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []source.RawJob) (*IngestResult, error) {
 	res := &IngestResult{SkippedReasons: map[string]int{}}
 	if len(raws) == 0 {
@@ -429,7 +431,7 @@ func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []so
 	for i := range candidates {
 		c := candidates[i]
 		g.Go(func() error {
-			created, _, reason, err := p.processCandidate(gctx, userID, c, profile, cityScores, resumeBrief, true)
+			created, jobID, _, reason, needsEnrichment, err := p.processCandidate(gctx, userID, c, profile, cityScores, resumeBrief, true)
 			if err != nil {
 				slog.Warn("处理岗位候选失败", "url", c.NormalizedURL, "error", err.Error())
 				return nil
@@ -438,8 +440,14 @@ func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []so
 			defer mu.Unlock()
 			if created {
 				res.NewCount++
+				if needsEnrichment {
+					res.PendingEnrichmentIDs = append(res.PendingEnrichmentIDs, jobID)
+				}
 			} else if reason == "duplicate" {
 				res.DupCount++
+				if needsEnrichment {
+					res.PendingEnrichmentIDs = append(res.PendingEnrichmentIDs, jobID)
+				}
 			} else {
 				res.Skipped++
 				if reason != "" {
@@ -461,7 +469,7 @@ func (p *Pipeline) IngestRawJobs(ctx context.Context, userID model.ID, raws []so
 // processCandidate 处理单个候选：查库去重 → 丰富内容 → 评分 → 落库。
 // 返回是否新建、最终匹配分、跳过原因。
 //
-// trustSource=true 表示候选来自可信来源（如浏览器半固定脚本从官方详情页抽取的
+// trustSource=true 表示候选来自可信来源（如浏览器 Recipe/探索从官方站点抽取的
 // 真实岗位链接）：此时跳过「AI 页面类型判定」这一闸，且 LLM 解析/匹配失败时降级
 // 为规则分 + 原始正文落库，而不是整条丢弃。因为这类内容可信度远高于联网搜索的
 // 脏文本，不应因 LLM 临时不可用（如 402 额度耗尽）而颗粒无收。
@@ -473,23 +481,23 @@ func (p *Pipeline) processCandidate(
 	cityScores map[string]int,
 	resumeBrief string,
 	trustSource bool,
-) (ok bool, score int, reason string, err error) {
+) (ok bool, jobID model.ID, score int, reason string, needsEnrichment bool, err error) {
 	// 单个候选处理中的任何 panic 都不能拖垮整个 worker：捕获后降级为「跳过该候选」。
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("处理候选时发生 panic，已跳过该候选",
 				"url", c.NormalizedURL, "panic", fmt.Sprintf("%v", r))
-			ok, score, reason, err = false, 0, "panic", fmt.Errorf("候选处理异常（已跳过）: %v", r)
+			ok, jobID, score, reason, needsEnrichment, err = false, model.ID{}, 0, "panic", false, fmt.Errorf("候选处理异常（已跳过）: %v", r)
 		}
 	}()
 	// ---- 跨批次去重：已按用户要求暂时停用 ----
 	// 这里不做复杂的语义合并，只用确定性的 URL / 指纹判断「是否已经入库」。
 	// 命中后刷新来源与来源侧元数据并短路，避免重复爬取时先调用 LLM、最后再撞唯一索引。
 	if existing, found, err := p.findExistingCandidate(ctx, c); err != nil {
-		return false, 0, "dedup_lookup_failed", err
+		return false, model.ID{}, 0, "dedup_lookup_failed", false, err
 	} else if found {
 		p.refreshExistingJob(ctx, existing, c)
-		return false, existing.MatchScore, "duplicate", nil
+		return false, existing.ID, existing.MatchScore, "duplicate", jobNeedsEnrichment(existing), nil
 	}
 
 	// ---- 获取更完整的页面文本 ----
@@ -509,7 +517,7 @@ func (p *Pipeline) processCandidate(
 	listOnly := isOfficialListOnlyCandidate(c, trustSource, pageText)
 	if strings.TrimSpace(pageText) == "" && !listOnly {
 		// 完全没有可用文本，不虚构内容，直接跳过。
-		return false, 0, "empty_text", errors.New("候选缺少可用文本")
+		return false, model.ID{}, 0, "empty_text", false, errors.New("候选缺少可用文本")
 	}
 
 	// ---- AI 页面类型判定：聚合页 / 具体岗位页 / 无关页 ----
@@ -519,17 +527,17 @@ func (p *Pipeline) processCandidate(
 	// 判定失败时同样跳过：模型不可用时放行会导致聚合页/无关页被当成岗位入库，
 	// 这正是「搜出来根本不是具体岗位信息」的噪声来源。宁可漏，不可错。
 	//
-	// 例外：trustSource（浏览器脚本抽取的官方详情页）本身已通过 URL 形态校验，
+	// 例外：trustSource（浏览器 Recipe/探索抽取的官方岗位数据）本身来自站点真实列表，
 	// 可信度足够，跳过此闸；即便 LLM 不可用也让岗位正常落库。
 	if !trustSource && p.llm.Enabled() {
 		pageType, perr := p.llm.ClassifyPage(ctx, c.Title, pageText, c.Raw.URL)
 		if perr != nil {
 			slog.Warn("页面类型判定失败，跳过该候选", "url", c.Raw.URL, "error", perr.Error())
-			return false, 0, "classify_failed", nil
+			return false, model.ID{}, 0, "classify_failed", false, nil
 		}
 		if pageType != ai.PageTypeJobDetail {
 			slog.Info("跳过非岗位详情页", "page_type", pageType, "title", c.Title, "url", c.Raw.URL)
-			return false, 0, "not_job_detail", nil
+			return false, model.ID{}, 0, "not_job_detail", false, nil
 		}
 	}
 
@@ -542,11 +550,11 @@ func (p *Pipeline) processCandidate(
 
 	// ---- 实习/校招岗位过滤 ----
 	// 仅对不可信来源（联网搜索脏文本）启用：Tavily 常混入大量无关实习/校招噪声。
-	// 浏览器半固定脚本来自官方详情页、且用户主动指定了校招入口，不应再被此过滤器丢弃。
+	// 浏览器 Recipe/探索来自用户指定的官方入口，不应再被此过滤器丢弃。
 	if !trustSource && LooksLikeInternship(c.Title, descText) {
 		slog.Info("跳过实习/校招类岗位",
 			"title", c.Title, "url", c.NormalizedURL)
-		return false, 0, "internship", nil
+		return false, model.ID{}, 0, "internship", false, nil
 	}
 
 	// ---- LLM 结构化解析（失败则退化为原始文本） ----
@@ -590,53 +598,66 @@ func (p *Pipeline) processCandidate(
 	// 纳入 URLID：让不同 postid 的同名岗位拥有不同指纹。
 	job.DedupFingerprint = URLIDFingerprint(job.CompanyName, job.Title, job.Location, ExtractURLJobID(c.NormalizedURL))
 	if existing, found, err := p.findExistingJob(ctx, job); err != nil {
-		return false, 0, "dedup_lookup_failed", err
+		return false, model.ID{}, 0, "dedup_lookup_failed", false, err
 	} else if found {
 		p.refreshExistingJob(ctx, existing, c)
-		return false, existing.MatchScore, "duplicate", nil
+		return false, existing.ID, existing.MatchScore, "duplicate", jobNeedsEnrichment(existing), nil
 	}
 
 	// ---- 评分 ----
-	rule := ComputeRuleScore(ScoreInput{Job: job, Profile: profile, CityScores: cityScores})
+	deferMatch := shouldDeferMatch(job, descQuality, listOnly, trustSource)
+	if deferMatch {
+		job.DescQuality = string(DescQualitySnippet)
+		job.MatchScore = 0
+		job.MatchAnalysis = pendingMatchAnalysis()
+		job.EnrichmentStatus = model.EnrichmentStatusPending
+		now := time.Now().UTC()
+		job.EnrichmentUpdatedAt = &now
+	} else {
+		job.EnrichmentStatus = model.EnrichmentStatusEnriched
+		now := time.Now().UTC()
+		job.EnrichmentUpdatedAt = &now
+		rule := ComputeRuleScore(ScoreInput{Job: job, Profile: profile, CityScores: cityScores})
 
-	var llmResult *ai.MatchResult
-	if p.llm.Enabled() && !listOnly {
-		in := ai.MatchInput{
-			Job: ai.MatchJobBrief{
-				CompanyName:    job.CompanyName,
-				Department:     job.Department,
-				Title:          job.Title,
-				Locations:      job.Locations,
-				JobType:        job.JobType,
-				Requirements:   job.Requirements,
-				TechnicalStack: job.TechnicalStack,
-				Description:    job.Description,
-			},
-			Profile: ai.MatchProfile{
-				TargetRoles:        profile.TargetRoles,
-				PreferredLanguages: profile.PreferredLanguages,
-				PreferredLocations: profile.PreferredLocations,
-				CompanyPreferences: profile.CompanyPreferences,
-				GraduationYear:     profile.GraduationYear,
-			},
-			ResumeSummary: resumeBrief,
-			RuleScore:     rule.Total,
+		var llmResult *ai.MatchResult
+		if p.llm.Enabled() && !listOnly {
+			in := ai.MatchInput{
+				Job: ai.MatchJobBrief{
+					CompanyName:    job.CompanyName,
+					Department:     job.Department,
+					Title:          job.Title,
+					Locations:      job.Locations,
+					JobType:        job.JobType,
+					Requirements:   job.Requirements,
+					TechnicalStack: job.TechnicalStack,
+					Description:    job.Description,
+				},
+				Profile: ai.MatchProfile{
+					TargetRoles:        profile.TargetRoles,
+					PreferredLanguages: profile.PreferredLanguages,
+					PreferredLocations: profile.PreferredLocations,
+					CompanyPreferences: profile.CompanyPreferences,
+					GraduationYear:     profile.GraduationYear,
+				},
+				ResumeSummary: resumeBrief,
+				RuleScore:     rule.Total,
+			}
+			if job.GraduationYear != nil {
+				in.Job.GraduationYear = *job.GraduationYear
+			}
+			if r, err := p.llm.MatchJob(ctx, in); err != nil {
+				slog.Warn("岗位匹配分析失败，使用规则分", "url", c.NormalizedURL, "error", err.Error())
+			} else {
+				llmResult = r
+			}
 		}
-		if job.GraduationYear != nil {
-			in.Job.GraduationYear = *job.GraduationYear
-		}
-		if r, err := p.llm.MatchJob(ctx, in); err != nil {
-			slog.Warn("岗位匹配分析失败，使用规则分", "url", c.NormalizedURL, "error", err.Error())
-		} else {
-			llmResult = r
-		}
-	}
 
-	analysis := FuseScores(rule, llmResult)
-	analysis.AnalyzedAt = time.Now().UTC().Format(time.RFC3339)
-	job.MatchScore = analysis.Score
-	if m, err := toJSONMap(analysis); err == nil {
-		job.MatchAnalysis = m
+		analysis := FuseScores(rule, llmResult)
+		analysis.AnalyzedAt = time.Now().UTC().Format(time.RFC3339)
+		job.MatchScore = analysis.Score
+		if m, err := toJSONMap(analysis); err == nil {
+			job.MatchAnalysis = m
+		}
 	}
 
 	// ---- 落库 ----
@@ -655,7 +676,7 @@ func (p *Pipeline) processCandidate(
 					"error", findErr.Error())
 			} else if found {
 				p.refreshExistingJob(ctx, existing, c)
-				return false, existing.MatchScore, "duplicate", nil
+				return false, existing.ID, existing.MatchScore, "duplicate", jobNeedsEnrichment(existing), nil
 			}
 		}
 		slog.Error("岗位落库失败",
@@ -665,10 +686,10 @@ func (p *Pipeline) processCandidate(
 			"source_type", job.SourceType,
 			"fingerprint", job.DedupFingerprint,
 			"error", err.Error())
-		return false, 0, "insert_failed", err
+		return false, model.ID{}, 0, "insert_failed", false, err
 	}
 	p.upsertSource(ctx, job.ID, c.Raw)
-	return true, job.MatchScore, "", nil
+	return true, job.ID, job.MatchScore, "", deferMatch, nil
 }
 
 // isOfficialListOnlyCandidate 标记“已由站点列表接口确认存在，但详情尚未取得”的岗位。
@@ -679,6 +700,40 @@ func isOfficialListOnlyCandidate(c Candidate, trustSource bool, pageText string)
 		strings.TrimSpace(c.Raw.URL) == "" &&
 		strings.TrimSpace(c.Raw.IdentityURL) != "" &&
 		strings.TrimSpace(pageText) == ""
+}
+
+func shouldDeferMatch(job *model.Job, descQuality DescriptionQuality, listOnly, trustSource bool) bool {
+	if job == nil {
+		return false
+	}
+	if !trustSource {
+		return false
+	}
+	if listOnly || descQuality != DescQualityFull {
+		return true
+	}
+	return len(job.Responsibilities) == 0 && len(job.Requirements) == 0
+}
+
+func jobNeedsEnrichment(job *model.Job) bool {
+	if job == nil {
+		return false
+	}
+	return job.DescQuality != string(DescQualityFull) || (len(job.Responsibilities) == 0 && len(job.Requirements) == 0)
+}
+
+func pendingMatchAnalysis() model.JSONMap {
+	return model.JSONMap{
+		"score":       0,
+		"rule_score":  0,
+		"llm_score":   0,
+		"reasons":     []string{"列表页信息不足，等待进入岗位详情页后再评估"},
+		"risks":       []string{},
+		"summary":     "pending_enrichment",
+		"status":      "pending_enrichment",
+		"analyzer":    "deferred",
+		"analyzed_at": time.Now().UTC().Format(time.RFC3339),
+	}
 }
 
 func (p *Pipeline) findExistingCandidate(ctx context.Context, c Candidate) (*model.Job, bool, error) {
@@ -759,6 +814,13 @@ func existingJobRefreshFields(existing *model.Job, raw source.RawJob) map[string
 		if descQuality != DescQualityEmpty {
 			fields["description"] = TruncateRunes(descText, 20000)
 			fields["desc_quality"] = string(descQuality)
+			fields["enrichment_updated_at"] = time.Now().UTC()
+			if descQuality == DescQualityFull {
+				fields["enrichment_status"] = model.EnrichmentStatusEnriched
+				fields["enrichment_error"] = ""
+			} else {
+				fields["enrichment_status"] = model.EnrichmentStatusPending
+			}
 		}
 	}
 	return fields

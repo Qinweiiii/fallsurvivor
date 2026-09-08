@@ -4,7 +4,7 @@ import { useState } from 'react';
 import useSWR from 'swr';
 import { Drawer } from '@/components/ui/Drawer';
 import { Button } from '@/components/ui/Button';
-import { Badge } from '@/components/ui/Badge';
+import { Badge, enrichmentStatusToneOf } from '@/components/ui/Badge';
 import { MatchBadge } from './MatchBadge';
 import { ErrorState, Skeleton } from '@/components/ui/States';
 import { fetcher, jobsApi } from '@/lib/api';
@@ -13,6 +13,7 @@ import {
   cleanDisplayText,
   firstDisplayValue,
   formatDate,
+  ENRICHMENT_STATUS_LABELS,
   orDash,
   SOURCE_LABELS,
 } from '@/lib/utils';
@@ -191,10 +192,25 @@ export function JobDrawer({ jobId, onClose, onAddToCart, busy }: JobDrawerProps)
               />
               <Field label="岗位类型" value={orDash(data.job_type)} />
               <Field label="来源" value={SOURCE_LABELS[data.source_type] ?? data.source_type} />
+              <Field
+                label="JD 补全"
+                value={ENRICHMENT_STATUS_LABELS[data.enrichment_status] ?? data.enrichment_status}
+              />
               <Field label="发布时间" value={formatDate(data.published_at)} />
               <Field label="截止时间" value={formatDate(data.deadline)} />
               <Field label="发现时间" value={formatDate(data.crawled_at)} />
             </dl>
+            {data.enrichment_error ? (
+              <div className="mt-3 rounded bg-blossom-50 px-3 py-2 text-xs text-blossom-700">
+                {data.enrichment_error}
+              </div>
+            ) : data.enrichment_status && data.enrichment_status !== 'none' ? (
+              <div className="mt-3">
+                <Badge tone={enrichmentStatusToneOf(data.enrichment_status)}>
+                  {ENRICHMENT_STATUS_LABELS[data.enrichment_status] ?? data.enrichment_status}
+                </Badge>
+              </div>
+            ) : null}
 
             {data.sources.length > 1 ? (
               <div className="mt-3 flex flex-wrap items-center gap-1.5">

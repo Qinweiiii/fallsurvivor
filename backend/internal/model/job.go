@@ -28,6 +28,15 @@ const (
 // AllSourceTypes 用于参数校验。
 var AllSourceTypes = []string{SourceOfficial, SourceBoss, SourceTavily, SourceManual, SourceBrowser}
 
+// JD 补全状态。用于区分“岗位已发现”和“详情/匹配是否已完成”。
+const (
+	EnrichmentStatusNone      = "none"
+	EnrichmentStatusPending   = "pending_enrichment"
+	EnrichmentStatusEnriching = "enriching"
+	EnrichmentStatusEnriched  = "enriched"
+	EnrichmentStatusFailed    = "enrich_failed"
+)
+
 // MatchAnalysis 是匹配分析结果，结构固定，便于前端直接渲染。
 type MatchAnalysis struct {
 	Score      int      `json:"score"`
@@ -67,6 +76,9 @@ type Job struct {
 	CrawledAt            time.Time       `json:"crawled_at" gorm:"column:crawled_at"`
 	MatchScore           int             `json:"match_score" gorm:"column:match_score"`
 	MatchAnalysis        JSONMap         `json:"match_analysis" gorm:"column:match_analysis;type:jsonb"`
+	EnrichmentStatus     string          `json:"enrichment_status" gorm:"column:enrichment_status;default:none"`
+	EnrichmentError      string          `json:"enrichment_error" gorm:"column:enrichment_error"`
+	EnrichmentUpdatedAt  *time.Time      `json:"enrichment_updated_at" gorm:"column:enrichment_updated_at"`
 	Status               string          `json:"status" gorm:"column:status"`
 	Timestamps
 }

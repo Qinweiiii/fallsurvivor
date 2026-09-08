@@ -181,8 +181,7 @@ func (r *JobRepo) ListIncompleteJD(ctx context.Context, limit int, sourceTypes .
 		limit = 10
 	}
 	q := r.db.WithContext(ctx).
-		Where("desc_quality IS NULL OR desc_quality <> ?", "full").
-		Where("source_url IS NOT NULL AND source_url <> ''")
+		Where("desc_quality IS NULL OR desc_quality <> ?", "full")
 	if len(sourceTypes) > 0 {
 		q = q.Where("source_type IN ?", sourceTypes)
 	}
@@ -254,7 +253,7 @@ func (r *JobRepo) UpdateEnrichment(ctx context.Context, id model.ID, fields map[
 		"responsibilities": true, "requirements": true, "language_requirements": true,
 		"technical_stack": true, "source_url": true, "official_url": true, "published_at": true,
 		"deadline": true, "crawled_at": true, "match_score": true, "match_analysis": true,
-		"desc_quality": true,
+		"desc_quality": true, "enrichment_status": true, "enrichment_error": true, "enrichment_updated_at": true,
 	}
 	safe := make(map[string]any, len(fields))
 	for k, v := range fields {

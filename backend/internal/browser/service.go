@@ -316,6 +316,9 @@ func (s *Service) scrapeAndStore(ctx context.Context, jobID model.ID, taskID str
 	}
 	fields["crawled_at"] = time.Now().UTC()
 	fields["desc_quality"] = "full" // 浏览器抓取的 JD 质量为 full
+	fields["enrichment_status"] = model.EnrichmentStatusEnriched
+	fields["enrichment_error"] = ""
+	fields["enrichment_updated_at"] = time.Now().UTC()
 
 	// 仅更新白名单字段，避免误改用户状态 / 投递进度。
 	if err := s.store.Job.UpdateEnrichment(ctx, jobID, fields); err != nil {

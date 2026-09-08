@@ -34,6 +34,13 @@ type Explorer struct {
 	llm     *ai.Client
 	repo    *site.Repository
 
+	// 多角色协作（显式 agent 拓扑，见 explorer_agents.go）。
+	planner   planner
+	actor     actor
+	critic    critic
+	guardrail guardrail
+	memory    memory
+
 	// maxSteps 单次探索的最大步数。
 	maxSteps int
 	// confidenceThreshold 达到该信心值即提前结束。
@@ -44,7 +51,7 @@ type Explorer struct {
 
 // NewExplorer 构造探索器。
 func NewExplorer(bc *browser.Client, llm *ai.Client, repo *site.Repository) *Explorer {
-	return &Explorer{
+	e := &Explorer{
 		browser:             bc,
 		llm:                 llm,
 		repo:                repo,
@@ -52,6 +59,13 @@ func NewExplorer(bc *browser.Client, llm *ai.Client, repo *site.Repository) *Exp
 		confidenceThreshold: defaultConfidenceThreshold,
 		topNCandidates:      defaultTopNCandidates,
 	}
+	// 角色持有回指，委托回 Explorer 既有方法，不引入新运行时行为。
+	e.planner = planner{e: e}
+	e.actor = actor{e: e}
+	e.critic = critic{e: e}
+	e.guardrail = guardrail{e: e}
+	e.memory = memory{e: e}
+	return e
 }
 
 // 探索流程的默认值。
@@ -194,7 +208,7 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 	allCandidates = append(allCandidates, toRequestViews(candidates)...)
 	keywordAttempted := false
 	lastResult := "已进入站点首页"
-	playbook := e.loadPlaybook(ctx)
+	playbook := e.memory.Recall(ctx)
 	var decision *ai.ExploreDecision
 	modelFinished := false
 	lastFingerprint := ""
@@ -227,47 +241,35 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 			NewRequests:      toRequestViews(candidates),
 			LastActionResult: lastResult,
 			ActionHistory:    recentActionHistory(result.Trace, 6),
-			ProgressHint:     progressHint(stagnantSteps, lastResult),
+			ProgressHint:     e.critic.ProgressHint(stagnantSteps, lastResult),
 		}
 
 		// 模型决策。
-		decision, err = e.decideWithRetry(ctx, obs)
+		decision, err = e.planner.Decide(ctx, obs)
 		if err != nil {
 			result.Reason = "LLM 决策失败: " + err.Error()
 			break
 		}
 
-		keywordProbePending := shouldProbeKeyword(req.Keyword, obs, allCandidates, keywordAttempted)
-		if keywordProbePending && shouldUseKeywordProbe(decision, e.confidenceThreshold) {
-			decision = &ai.ExploreDecision{
-				Action:     string(ai.ExploreSearch),
-				TargetRef:  searchInputRef(obs.Elements, ""),
-				Target:     strings.TrimSpace(req.Keyword),
-				Confidence: 45,
-				Reasoning:  "先验证关键词搜索路径",
-			}
+		// Guardrail：执行前拦截 / 改写高风险与无意义决策（重复 inspect、越界导航等）。
+		proceed, override, guardReason := e.guardrail.Check(
+			step, decision, req.Keyword, keywordAttempted, obs,
+			candidates, inspectedSeqs, allCandidates,
+		)
+		if override != nil {
+			decision = override
 		}
-		if decision.Action == string(ai.ExploreSearch) {
-			decision.TargetRef = searchInputRef(obs.Elements, decision.TargetRef)
-		}
-		if decision.Action == string(ai.ExploreInspect) {
-			if seq := inspectSeq(decision.Target, decision.TargetRef); seq > 0 && inspectedSeqs[seq] {
-				if next := firstUninspectedRequest(toRequestViews(candidates), inspectedSeqs); next > 0 {
-					decision.Target = strconv.Itoa(next)
-					decision.TargetRef = ""
-					decision.Reasoning = "避免重复 inspect，改查下一个候选请求"
-				} else if keywordProbePending {
-					decision.Action = string(ai.ExploreSearch)
-					decision.TargetRef = searchInputRef(obs.Elements, "")
-					decision.Target = strings.TrimSpace(req.Keyword)
-					decision.Confidence = 45
-					decision.Reasoning = "候选请求已检查过，改用关键词搜索触发新请求"
-				} else {
-					decision.Target = strconv.Itoa(seq)
-					decision.TargetRef = ""
-					decision.Reasoning = "重复 inspect 已拒绝，请根据历史选择新的页面动作"
-				}
-			}
+		if !proceed {
+			result.Trace = append(result.Trace, ExploreStepTrace{
+				Step:       step,
+				Action:     decision.Action,
+				Target:     decision.Target,
+				Reasoning:  guardReason,
+				Result:     guardReason,
+				Confidence: decision.Confidence,
+			})
+			lastResult = guardReason
+			continue
 		}
 
 		trace := ExploreStepTrace{
@@ -320,7 +322,7 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 		}
 
 		// 执行动作。
-		execRes := e.executeAction(ctx, taskID, decision, req.Keyword)
+		execRes := e.actor.Act(ctx, taskID, decision, req.Keyword)
 		execMsg, execOK := execRes.Message, execRes.OK
 		trace.Result = execMsg
 		trace.CurrentURL = execRes.CurrentURL
@@ -443,7 +445,7 @@ func (e *Explorer) Explore(ctx context.Context, req ExploreRequest) (*ExploreRes
 	result.Success = true
 	result.Candidate = candidate
 	result.DurationMS = time.Since(start).Milliseconds()
-	e.recordPlaybookHits(context.WithoutCancel(ctx), candidate, allCandidates)
+	e.memory.Learn(context.WithoutCancel(ctx), candidate, allCandidates)
 
 	slog.Info("站点探索完成",
 		"site_key", siteKey,
@@ -534,7 +536,7 @@ func (e *Explorer) discoverDetailPage(
 
 	// 有些 SPA 职位卡片不是 <a>，只有点击后才改变路由。此处最多请求模型
 	// 选择一次代表岗位，且只接受 click，避免列表已确认后重新进入无界探索。
-	decision, err := e.decideWithRetry(ctx, ai.ExploreObservation{
+	decision, err := e.planner.Decide(ctx, ai.ExploreObservation{
 		Step:             0,
 		CurrentURL:       snap.CurrentURL,
 		PageTitle:        snap.Title,
@@ -547,7 +549,7 @@ func (e *Explorer) discoverDetailPage(
 	if err != nil || decision.Action != string(ai.ExploreClick) || strings.TrimSpace(decision.TargetRef) == "" {
 		return nil
 	}
-	if result := e.executeAction(ctx, taskID, decision, ""); !result.OK {
+	if result := e.actor.Act(ctx, taskID, decision, ""); !result.OK {
 		return nil
 	}
 	if _, err := e.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: exploreWaitAfterAction}); err != nil {

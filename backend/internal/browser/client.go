@@ -26,7 +26,20 @@ import (
 var (
 	ErrWorkerUnavailable = errors.New("browser: Playwright Worker 未运行或不可达")
 	ErrWorkerRejected    = errors.New("browser: Worker 拒绝了本次请求")
+	// ErrLoginExpired 站点登录态已过期，需要用户在 Worker 中重新登录。
+	// 与 Recipe 配置无关，不应触发 Recipe 失效。
+	ErrLoginExpired = errors.New("browser: 站点登录态已过期，需要重新登录")
 )
+
+// IsEnvError 判断错误是否来自浏览器环境（Worker 未运行 / 登录过期）。
+// 这类失败与 Recipe 配置无关，Fast Path 处理时应提示用户处理，
+// 而不应把它当作 Recipe 失效（避免把一条好配置废掉、下次重探烧 token）。
+func IsEnvError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrWorkerUnavailable) || errors.Is(err, ErrLoginExpired)
+}
 
 // Client 是 Worker 的 HTTP 客户端。
 type Client struct {
@@ -441,7 +454,7 @@ func (c *Client) Markdown(ctx context.Context, taskID string) (*PageMarkdown, er
 	return &out, nil
 }
 
-// ExtractJobs 从当前列表页抽取结构化岗位卡片（半固定脚本使用）。
+// ExtractJobs 从当前列表页抽取结构化岗位卡片（Recipe 浏览器采集使用）。
 // keyword 为可选搜索关键词，非空时由 Worker 在站点搜索框提交后抽取过滤结果。
 func (c *Client) ExtractJobs(ctx context.Context, taskID, keyword string) (*ExtractJobsResponse, error) {
 	var out ExtractJobsResponse

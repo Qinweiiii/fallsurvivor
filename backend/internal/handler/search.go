@@ -17,8 +17,10 @@ import (
 	"github.com/eddiel/fallsurvivor/backend/internal/executor"
 	"github.com/eddiel/fallsurvivor/backend/internal/handler/dto"
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
+	"github.com/eddiel/fallsurvivor/backend/internal/browser"
 	"github.com/eddiel/fallsurvivor/backend/internal/repository"
 	searchsvc "github.com/eddiel/fallsurvivor/backend/internal/service/search"
+	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/eddiel/fallsurvivor/backend/internal/source"
 	"github.com/eddiel/fallsurvivor/backend/pkg/response"
 )
@@ -184,17 +186,41 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 			Keyword: req.Keyword,
 		})
 		if fast != nil && fast.Hit {
-			if fastErr != nil {
-				// 本次真实执行已经证明 Recipe 不可用，立即用同一个用户请求
-				// 重新探索并覆盖旧配置；不先做额外接口验证或盲目重试。
+			jobs, recipe, jobsFound := fast.Jobs, fast.Recipe, fast.JobsFound
+			runErr := fastErr
+
+			// api 策略失败但存有 browser_plan → 降级到 browser_observed 重试。
+			// 用户明确要求的核心环节：api 失败大概率是反爬拦截，不代表配置错误，
+			// 因此绝不能退回重探（烧 token），也不该把它当 recipe 失效。
+			if runErr != nil && recipe != nil &&
+				recipe.StrategyType == site.StrategyAPI && recipe.BrowserPlan != nil {
+				downgraded := *recipe
+				downgraded.StrategyType = site.StrategyBrowserObserved
+				dJobs, dErr := h.discovery.ExecuteRecipe(c.Request.Context(), &downgraded, req.Keyword, taskID)
+				if dErr == nil && len(dJobs) > 0 {
+					jobs, recipe, jobsFound = dJobs, &downgraded, len(dJobs)
+					runErr = nil
+					slog.Info("api 策略失败，已降级 browser_observed 重试成功",
+						"site_key", siteKey, "jobs", jobsFound)
+				}
+			}
+
+			if runErr != nil {
+				if browser.IsEnvError(runErr) {
+					// Worker 未启动 / 登录态过期：环境故障，与 recipe 配置无关，
+					// 提示用户处理，不动 recipe、不重探。
+					response.UpstreamFailed(c, "浏览器 Worker 未启动或登录态已过期，请先执行 make bw 并确认登录态后重试")
+					return
+				}
+				// 配置确实失效 → 用同一请求重新探索并覆盖旧配置。
 				forceExplore = true
-				slog.Warn("Recipe Fast Path 失败，转入重新探索", "site_key", siteKey, "error", fastErr.Error())
+				slog.Warn("Recipe Fast Path 失败，转入重新探索", "site_key", siteKey, "error", runErr.Error())
 			} else {
-				// 同步入库并返回真实诊断：后台 goroutine 会把失败吞掉，
-				// 返回 ingested=len(raws) 只是「投进队列的条数」，库里是否真落库无从得知。
+				// 命中且成功（含降级成功）→ 直接入库返回真实诊断。
+				fieldQuality := executor.BuildFieldQuality(jobs)
 				opCtx, opCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Minute)
 				defer opCancel()
-				ingestRes, ingestErr := h.svc.IngestRawJobs(opCtx, userID, fast.Jobs)
+				ingestRes, ingestErr := h.svc.IngestRawJobs(opCtx, userID, jobs)
 				if ingestErr != nil {
 					slog.Warn("Recipe 岗位入库失败", "site_key", siteKey, "error", ingestErr.Error())
 				}
@@ -203,24 +229,28 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 				if ingestRes != nil {
 					ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
 				}
+				enrichQueued, enrichErr := h.enqueueEnrichmentFromIngest(opCtx, userID, ingestRes, req.Keyword)
 				siteName := siteKey
 				company := ""
-				if fast.Recipe != nil {
-					siteName = displayName(fast.Recipe.CompanyName, siteKey)
-					company = fast.Recipe.CompanyName
+				if recipe != nil {
+					siteName = displayName(recipe.CompanyName, siteKey)
+					company = recipe.CompanyName
 				}
 				response.OK(c, gin.H{
-					"site_key":        siteKey,
-					"site_name":       siteName,
-					"company":         company,
-					"count":           fast.JobsFound,
-					"jobs":            jobsFromRaw(fast.Jobs),
-					"strategy":        "站点 Recipe（" + string(fast.Recipe.StrategyType) + "）",
-					"ingested":        ingested,
-					"duplicate":       dup,
-					"skipped":         skipped,
-					"skipped_reasons": reasons,
-					"field_quality":   fast.FieldQuality,
+					"site_key":           siteKey,
+					"site_name":          siteName,
+					"company":            company,
+					"count":              jobsFound,
+					"jobs":               jobsFromRaw(jobs),
+					"strategy":           "站点 Recipe（" + string(recipe.StrategyType) + "）",
+					"ingested":           ingested,
+					"duplicate":          dup,
+					"skipped":            skipped,
+					"skipped_reasons":    reasons,
+					"pending_enrichment": pendingEnrichmentCount(ingestRes),
+					"enrichment_queued":  enrichQueued,
+					"enrichment_error":   enrichmentErrorString(enrichErr),
+					"field_quality":      fieldQuality,
 				})
 				return
 			}
@@ -233,7 +263,7 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 			slog.Warn("站点 Recipe 已失效，自动转入重新探索",
 				"site_key", siteKey, "last_error", fast.RexploreReason)
 		}
-		// 未命中 Recipe：默认对非半固定脚本站点转入探索，避免回到旧的通用导航。
+		// 未命中 Recipe：默认对非 BOSS 站点转入探索，避免回到旧的通用导航。
 		if shouldAutoExplore(siteKey, req.Strategy) {
 			forceExplore = true
 		}
@@ -297,24 +327,28 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 		if ingestRes != nil {
 			ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
 		}
+		enrichQueued, enrichErr := h.enqueueEnrichmentFromIngest(opCtx, userID, ingestRes, req.Keyword)
 
 		response.OK(c, gin.H{
-			"site_key":        explored.Recipe.SiteKey,
-			"site_name":       displayName(explored.Recipe.CompanyName, explored.Recipe.SiteKey),
-			"company":         explored.Recipe.CompanyName,
-			"count":           len(explored.Jobs),
-			"jobs":            jobsFromRaw(explored.Jobs),
-			"strategy":        "站点探索（已保存页面动作与本次真实结果）",
-			"recipe_id":       explored.Recipe.ID,
-			"saved":           explored.Saved,
-			"trace":           explored.Trace,
-			"candidate":       explored.Candidate,
-			"ingested":        ingested,
-			"duplicate":       dup,
-			"skipped":         skipped,
-			"skipped_reasons": reasons,
-			"ingest_status":   "completed",
-			"next_action":     "下次调用 crawl 且不传 strategy=explore 时会执行保存的页面动作；失败时自动重新探索并覆盖旧 Recipe。",
+			"site_key":           explored.Recipe.SiteKey,
+			"site_name":          displayName(explored.Recipe.CompanyName, explored.Recipe.SiteKey),
+			"company":            explored.Recipe.CompanyName,
+			"count":              len(explored.Jobs),
+			"jobs":               jobsFromRaw(explored.Jobs),
+			"strategy":           "站点探索（已保存页面动作与本次真实结果）",
+			"recipe_id":          explored.Recipe.ID,
+			"saved":              explored.Saved,
+			"trace":              explored.Trace,
+			"candidate":          explored.Candidate,
+			"ingested":           ingested,
+			"duplicate":          dup,
+			"skipped":            skipped,
+			"skipped_reasons":    reasons,
+			"pending_enrichment": pendingEnrichmentCount(ingestRes),
+			"enrichment_queued":  enrichQueued,
+			"enrichment_error":   enrichmentErrorString(enrichErr),
+			"ingest_status":      "completed",
+			"next_action":        "下次调用 crawl 且不传 strategy=explore 时会执行保存的页面动作；失败时自动重新探索并覆盖旧 Recipe。",
 			// 验证信息：让使用者看到「Agent 自己试跑通了，采到了这些岗位」，
 			// 以及为此做了几轮自修正。这是判断探索质量的关键依据。
 			"verified":       explored.Verified,
@@ -363,40 +397,30 @@ func (h *SearchHandler) Crawl(c *gin.Context) {
 		if ingestRes != nil {
 			ingested, dup, skipped, reasons = ingestRes.NewCount, ingestRes.DupCount, ingestRes.Skipped, ingestRes.SkippedReasons
 		}
+		enrichQueued, enrichErr := h.enqueueEnrichmentFromIngest(opCtx, userID, ingestRes, req.Keyword)
 		response.OK(c, gin.H{
-			"site_key":        siteKey,
-			"site_name":       siteDisplayName(siteKey),
-			"count":           len(navJobs),
-			"jobs":            navJobs,
-			"strategy":        strategyName(siteKey),
-			"ingested":        ingested,
-			"duplicate":       dup,
-			"skipped":         skipped,
-			"skipped_reasons": reasons,
-			"field_quality":   executor.BuildFieldQuality(raws),
+			"site_key":           siteKey,
+			"site_name":          siteDisplayName(siteKey),
+			"count":              len(navJobs),
+			"jobs":               navJobs,
+			"strategy":           strategyName(siteKey),
+			"ingested":           ingested,
+			"duplicate":          dup,
+			"skipped":            skipped,
+			"skipped_reasons":    reasons,
+			"pending_enrichment": pendingEnrichmentCount(ingestRes),
+			"enrichment_queued":  enrichQueued,
+			"enrichment_error":   enrichmentErrorString(enrichErr),
+			"field_quality":      executor.BuildFieldQuality(raws),
 		})
 		return
 	}
 
-	jobs, err := h.crawler.Crawl(c.Request.Context(), taskID, siteKey, req.URL, req.Strategy)
-	if err != nil {
-		// 需要登录时给出明确的手动操作引导。
-		msg := err.Error()
-		if strings.Contains(msg, "需要登录") || strings.Contains(msg, "请先登录") {
-			siteName := siteDisplayName(siteKey)
-			msg = fmt.Sprintf("%s\n\n操作指引：\n1. 确保终端已运行 make bw（Playwright Worker）\n2. Worker 应已弹出浏览器窗口，请在其中完成 %s 登录\n3. 登录成功后重新点击「开始爬取」", msg, siteName)
-		}
-		response.UpstreamFailed(c, "导航爬虫执行失败："+msg)
-		return
+	msg := "未命中可用站点 Recipe，且站点探索服务未启用；请启用 Discovery 后使用 strategy=explore 完成首次探索"
+	if h.discovery != nil {
+		msg = "未命中可用站点 Recipe；请使用 strategy=explore 完成首次探索并保存 Recipe"
 	}
-
-	response.OK(c, gin.H{
-		"site_key":  siteKey,
-		"site_name": siteDisplayName(siteKey),
-		"count":     len(jobs),
-		"jobs":      jobs,
-		"strategy":  strategyName(siteKey),
-	})
+	response.Fail(c, http.StatusBadRequest, response.CodeInvalidParam, msg)
 }
 
 func shouldExploreCrawl(strategy string, saveAsRecipe bool) bool {
@@ -405,6 +429,31 @@ func shouldExploreCrawl(strategy string, saveAsRecipe bool) bool {
 		return true
 	}
 	return false
+}
+
+func (h *SearchHandler) enqueueEnrichmentFromIngest(ctx context.Context, userID model.ID, ingest *searchsvc.IngestResult, keyword string) (int, error) {
+	if ingest == nil || len(ingest.PendingEnrichmentIDs) == 0 {
+		return 0, nil
+	}
+	queued, err := h.svc.EnqueueEnrichment(ctx, userID, ingest.PendingEnrichmentIDs, 0, keyword)
+	if err != nil {
+		slog.Warn("JD 补全任务派发失败", "jobs", len(ingest.PendingEnrichmentIDs), "error", err.Error())
+	}
+	return queued, err
+}
+
+func pendingEnrichmentCount(ingest *searchsvc.IngestResult) int {
+	if ingest == nil {
+		return 0
+	}
+	return len(ingest.PendingEnrichmentIDs)
+}
+
+func enrichmentErrorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func shouldAutoExplore(siteKey, strategy string) bool {
@@ -451,12 +500,10 @@ func siteDisplayName(siteKey string) string {
 // strategyName 返回当前使用的导航策略名称。
 func strategyName(siteKey string) string {
 	switch siteKey {
-	case "tencent", "bytedance":
-		return "半固定脚本（省 token）"
 	case "boss":
 		return "可视化逐详情采集（最多 3 条）"
 	default:
-		return "AI 逐步导航"
+		return "站点 Recipe"
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/eddiel/fallsurvivor/backend/internal/browser"
 	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/eddiel/fallsurvivor/backend/internal/source"
 	"github.com/eddiel/fallsurvivor/backend/pkg/safefetch"
@@ -140,7 +141,13 @@ func (e *Executor) recordRun(ctx context.Context, rc *site.Recipe, keyword strin
 	}
 	switch {
 	case runErr != nil:
-		run.Status = site.RunFailed
+		// 环境故障（Worker 未运行 / 登录过期）与 Recipe 配置无关，
+		// 记成 environment：只留痕、不计入连续失败、不触发失效。
+		if browser.IsEnvError(runErr) {
+			run.Status = site.RunEnvironment
+		} else {
+			run.Status = site.RunFailed
+		}
 		run.ErrorMessage = runErr.Error()
 	case len(jobs) == 0:
 		run.Status = site.RunEmpty
@@ -178,7 +185,7 @@ func (e *Executor) updateHealth(ctx context.Context, rc *site.Recipe, run *site.
 		}
 		return
 	}
-	if run.Status == site.RunEmpty {
+	if run.Status == site.RunEmpty || run.Status == site.RunEnvironment {
 		return
 	}
 

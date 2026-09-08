@@ -19,6 +19,8 @@ uploads/
 # ---- go ----
 backend/bin/
 backend/tmp/
+# go build cache (do NOT commit; keep local GOCACHE out of the repo)
+.cache/
 *.test
 coverage.out
 
@@ -41,3 +43,13 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ---- python / virtualenv (NEVER commit) ----
+**/.venv/
+**/.venv-*/
+**/venv/
+**/__pycache__/
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/

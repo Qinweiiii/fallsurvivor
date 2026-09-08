@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/eddiel/fallsurvivor/backend/internal/browser"
 	"github.com/eddiel/fallsurvivor/backend/internal/model"
 	"github.com/eddiel/fallsurvivor/backend/internal/repository"
-	"github.com/eddiel/fallsurvivor/backend/internal/source"
+	"github.com/eddiel/fallsurvivor/backend/internal/site"
 	"github.com/google/uuid"
 )
 
@@ -55,6 +56,21 @@ func NewEnrichmentService(bc *browser.Client, llm *ai.Client, store *repository.
 	}
 }
 
+// RunEnrichment 适配 task.EnrichmentRunner。
+func (s *EnrichmentService) RunEnrichment(ctx context.Context, userID uuid.UUID, jobIDs []uuid.UUID, maxJobs int, keyword string) error {
+	ids := make([]model.ID, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		ids = append(ids, model.ID(id))
+	}
+	_, err := s.EnrichIncomplete(ctx, EnrichRequest{
+		UserID:  model.ID(userID),
+		JobIDs:  ids,
+		MaxJobs: maxJobs,
+		Keyword: keyword,
+	})
+	return err
+}
+
 // 补全流程的默认值。
 const (
 	// defaultMaxEnrichPerRun 单次补全最多处理多少个岗位。
@@ -74,6 +90,8 @@ type EnrichRequest struct {
 	UserID model.ID
 	// MaxJobs 本次最多补全多少条，0 表示用默认值。
 	MaxJobs int
+	// Keyword 是触发列表采集时使用的原始搜索词，用于回放同一个 job-list。
+	Keyword string
 	// CityScores 城市偏好打分表，由 BuildCityScores 生成；为空时按画像现场构造。
 	CityScores map[string]int
 }
@@ -130,14 +148,18 @@ func (s *EnrichmentService) EnrichIncomplete(ctx context.Context, req EnrichRequ
 	}
 	resumeBrief := s.loadResumeBrief(ctx, req.UserID)
 
-	// 打开共享浏览器会话：BOSS 需要登录态才能看到完整 JD。
-	// 用一次会话处理全部岗位，避免反复启动浏览器。
+	entryURL, siteKey, err := s.entryForJobs(ctx, jobs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 打开共享浏览器会话。是否需要登录只接受 Worker 的显式 needs_login，
+	// 不能因为页面上有“登录”按钮就中断公开页面补全。
 	taskID := uuid.NewString()
-	siteKey := s.detectSiteKey(jobs[0].SourceURL)
 	session, err := s.browser.OpenSession(ctx, browser.SessionRequest{
 		TaskID:  taskID,
 		SiteKey: siteKey,
-		URL:     jobs[0].SourceURL,
+		URL:     entryURL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("打开浏览器会话失败: %w", err)
@@ -149,7 +171,7 @@ func (s *EnrichmentService) EnrichIncomplete(ctx context.Context, req EnrichRequ
 	}()
 
 	// 未登录时给出明确指引：补全依赖用户自己的登录态。
-	if session.NeedsLogin || !session.LoggedIn {
+	if session.NeedsLogin {
 		return nil, fmt.Errorf("需要登录：请在 Worker 弹出的浏览器中完成 %s 登录后再试", siteKey)
 	}
 
@@ -159,8 +181,9 @@ func (s *EnrichmentService) EnrichIncomplete(ctx context.Context, req EnrichRequ
 		cityScores = config.BuildCityScores(profile.PreferredLocations)
 	}
 
+	listState := &enrichmentListState{}
 	for i := range jobs {
-		res := s.enrichOne(ctx, taskID, &jobs[i], profile, resumeBrief, cityScores)
+		res := s.enrichOne(ctx, taskID, &jobs[i], req.Keyword, listState, profile, resumeBrief, cityScores)
 		summary.Results = append(summary.Results, res)
 		switch res.Status {
 		case "enriched":
@@ -187,6 +210,8 @@ func (s *EnrichmentService) enrichOne(
 	ctx context.Context,
 	taskID string,
 	job *model.Job,
+	listKeyword string,
+	listState *enrichmentListState,
 	profile *model.JobProfile,
 	resumeBrief string,
 	cityScores map[string]int,
@@ -196,34 +221,24 @@ func (s *EnrichmentService) enrichOne(
 		Title:    job.Title,
 		OldScore: job.MatchScore,
 	}
+	s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusEnriching, "")
 
-	url := strings.TrimSpace(job.SourceURL)
-	if url == "" {
+	detailURL, fromList, err := s.openDetailPage(ctx, taskID, job, listKeyword, listState)
+	if err != nil {
 		res.Status = "skipped"
-		res.Reason = "无来源 URL"
+		res.Reason = err.Error()
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
 		return res
 	}
-
-	// 导航到岗位原网页。
-	if _, err := s.browser.NavAct(ctx, taskID, browser.NavAction{
-		Type: browser.NavNavigate,
-		URL:  url,
-	}); err != nil {
-		res.Status = "failed"
-		res.Reason = "导航失败: " + err.Error()
-		return res
-	}
-	// SPA 需要等待渲染。
-	if _, err := s.browser.NavAct(ctx, taskID, browser.NavAction{
-		Type: browser.NavWait, Seconds: enrichWaitSeconds,
-	}); err != nil {
-		slog.Warn("补全等待渲染失败", "url", url, "error", err.Error())
+	if fromList {
+		defer s.returnToList(ctx, taskID, listState)
 	}
 
 	scrape, err := s.browser.ScrapePage(ctx, taskID)
 	if err != nil {
 		res.Status = "failed"
 		res.Reason = "抓取正文失败: " + err.Error()
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
 		return res
 	}
 
@@ -231,10 +246,18 @@ func (s *EnrichmentService) enrichOne(
 	runes := len([]rune(pageText))
 	res.Runes = runes
 
+	if looksLikeJobListPage(pageText) && !looksLikeJDDetailPage(pageText) {
+		res.Status = "skipped"
+		res.Reason = "仍停留在岗位列表页，未进入具体岗位详情"
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
+		return res
+	}
+
 	// 正文太短：多半是登录墙/验证页，不覆盖原有内容。
 	if runes < s.minAcceptRunes {
 		res.Status = "skipped"
 		res.Reason = fmt.Sprintf("抓到的正文过短（%d 字符），疑似需要登录或遇到验证页", runes)
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
 		return res
 	}
 
@@ -243,12 +266,26 @@ func (s *EnrichmentService) enrichOne(
 	if quality != DescQualityFull {
 		res.Status = "skipped"
 		res.Reason = "页面正文仍不构成完整 JD（quality=" + string(quality) + "）"
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
+		return res
+	}
+	if !looksLikeJDDetailPage(cleaned) {
+		res.Status = "skipped"
+		res.Reason = "页面没有职责/要求类正文块，暂不作为完整 JD"
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
 		return res
 	}
 
+	if detailURL != "" && job.SourceURL == "" {
+		job.SourceURL = detailURL
+		if job.SourceType == model.SourceOfficial {
+			job.OfficialURL = detailURL
+		}
+	}
 	if err := s.applyEnrichment(ctx, job, cleaned, profile, resumeBrief, cityScores); err != nil {
 		res.Status = "failed"
 		res.Reason = "回填失败: " + err.Error()
+		s.markEnrichmentStatus(ctx, job.ID, model.EnrichmentStatusFailed, res.Reason)
 		return res
 	}
 
@@ -256,6 +293,224 @@ func (s *EnrichmentService) enrichOne(
 	res.DescQuality = string(DescQualityFull)
 	res.NewScore = job.MatchScore
 	return res
+}
+
+func (s *EnrichmentService) markEnrichmentStatus(ctx context.Context, jobID model.ID, status, reason string) {
+	fields := map[string]any{
+		"enrichment_status":     status,
+		"enrichment_error":      reason,
+		"enrichment_updated_at": time.Now().UTC(),
+	}
+	if err := s.store.Job.UpdateEnrichment(ctx, jobID, fields); err != nil {
+		slog.Warn("更新 JD 补全状态失败", "job_id", jobID.String(), "status", status, "error", err.Error())
+	}
+}
+
+type enrichmentListState struct {
+	key     string
+	listURL string
+}
+
+func (s *EnrichmentService) openDetailPage(ctx context.Context, taskID string, job *model.Job, listKeyword string, listState *enrichmentListState) (string, bool, error) {
+	if url := s.firstUsableDetailURL(ctx, job); url != "" {
+		if err := s.navigateAndWait(ctx, taskID, url); err != nil {
+			return "", false, fmt.Errorf("导航失败: %w", err)
+		}
+		return url, false, nil
+	}
+	rc, err := s.recipeForJob(ctx, job)
+	if err != nil {
+		return "", false, fmt.Errorf("读取站点 Recipe 失败: %w", err)
+	}
+	if rc == nil || strings.TrimSpace(rc.CampusURL) == "" {
+		return "", false, fmt.Errorf("无来源 URL，且未找到可回放的站点 Recipe")
+	}
+	entry := strings.TrimSpace(rc.CampusURL)
+	key := rc.SiteKey + "\n" + entry + "\n" + strings.TrimSpace(listKeyword)
+	if listState == nil || listState.key != key {
+		if err := s.navigateAndWait(ctx, taskID, entry); err != nil {
+			return "", false, fmt.Errorf("回到列表页失败: %w", err)
+		}
+		if err := runBrowserPlan(ctx, s.browser, taskID, rc.BrowserPlan, listKeyword, "enrichment"); err != nil {
+			return "", false, err
+		}
+		if listState != nil {
+			listState.key = key
+			listState.listURL = s.currentURL(ctx, taskID)
+		}
+	}
+	if strings.TrimSpace(job.Title) == "" {
+		return "", true, fmt.Errorf("岗位标题为空，无法从列表页定位岗位卡片")
+	}
+	resp, err := s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavClick, Text: job.Title})
+	if err != nil {
+		return "", true, fmt.Errorf("点击岗位卡片失败: %w", err)
+	}
+	if resp != nil && !resp.OK {
+		return "", true, fmt.Errorf("点击岗位卡片未完成: %s", resp.Message)
+	}
+	_, _ = s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: enrichWaitSeconds})
+	if resp != nil && isNavigableWebURL(resp.CurrentURL) && !sameAPIPath(entry, resp.CurrentURL) {
+		return resp.CurrentURL, true, nil
+	}
+	return "", true, nil
+}
+
+func (s *EnrichmentService) returnToList(ctx context.Context, taskID string, listState *enrichmentListState) {
+	if listState == nil || strings.TrimSpace(listState.listURL) == "" {
+		return
+	}
+	current := s.currentURL(ctx, taskID)
+	if current == "" || current == listState.listURL {
+		return
+	}
+	if _, err := s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavBack}); err != nil {
+		slog.Warn("补全后返回列表页失败", "error", err.Error())
+		return
+	}
+	_, _ = s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: enrichWaitSeconds})
+}
+
+func (s *EnrichmentService) currentURL(ctx context.Context, taskID string) string {
+	status, err := s.browser.GetStatus(ctx, taskID)
+	if err != nil || status == nil {
+		return ""
+	}
+	return strings.TrimSpace(status.CurrentURL)
+}
+
+func (s *EnrichmentService) firstUsableDetailURL(ctx context.Context, job *model.Job) string {
+	for _, raw := range []string{job.SourceURL, job.OfficialURL} {
+		if isNavigableWebURL(raw) {
+			return strings.TrimSpace(raw)
+		}
+	}
+	rc, err := s.recipeForJob(ctx, job)
+	if err != nil || rc == nil || strings.TrimSpace(rc.DetailURLTemplate) == "" {
+		return ""
+	}
+	id := firstNonEmpty(
+		ExtractURLJobID(job.NormalizedURL),
+		ExtractURLJobID(job.SourceURL),
+		ExtractURLJobID(job.OfficialURL),
+	)
+	if id == "" {
+		return ""
+	}
+	return strings.ReplaceAll(rc.DetailURLTemplate, "{id}", url.QueryEscape(id))
+}
+
+func (s *EnrichmentService) navigateAndWait(ctx context.Context, taskID, rawURL string) error {
+	resp, err := s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavNavigate, URL: rawURL})
+	if err != nil {
+		return err
+	}
+	if resp != nil && !resp.OK {
+		return errors.New(resp.Message)
+	}
+	if _, err := s.browser.NavAct(ctx, taskID, browser.NavAction{Type: browser.NavWait, Seconds: enrichWaitSeconds}); err != nil {
+		slog.Warn("补全等待渲染失败", "url", rawURL, "error", err.Error())
+	}
+	return nil
+}
+
+func (s *EnrichmentService) entryForJobs(ctx context.Context, jobs []model.Job) (string, string, error) {
+	for i := range jobs {
+		if url := s.firstUsableDetailURL(ctx, &jobs[i]); url != "" {
+			return url, s.detectSiteKeyFromJob(ctx, &jobs[i]), nil
+		}
+	}
+	for i := range jobs {
+		rc, err := s.recipeForJob(ctx, &jobs[i])
+		if err != nil {
+			return "", "", err
+		}
+		if rc != nil && strings.TrimSpace(rc.CampusURL) != "" {
+			return rc.CampusURL, firstNonEmpty(rc.SiteKey, s.detectSiteKey(rc.CampusURL)), nil
+		}
+	}
+	return "", "", fmt.Errorf("没有可打开的岗位详情 URL 或站点入口")
+}
+
+func (s *EnrichmentService) detectSiteKeyFromJob(ctx context.Context, job *model.Job) string {
+	if rc, err := s.recipeForJob(ctx, job); err == nil && rc != nil && strings.TrimSpace(rc.SiteKey) != "" {
+		return rc.SiteKey
+	}
+	return s.detectSiteKey(firstNonEmpty(job.SourceURL, job.OfficialURL, job.NormalizedURL))
+}
+
+func (s *EnrichmentService) recipeForJob(ctx context.Context, job *model.Job) (*site.Recipe, error) {
+	if job == nil || s.store == nil || s.store.Site == nil {
+		return nil, nil
+	}
+	siteKey := s.detectSiteKey(firstNonEmpty(job.SourceURL, job.OfficialURL, job.NormalizedURL))
+	if siteKey != "" && siteKey != "generic" {
+		rc, err := s.store.Site.GetBySiteKey(ctx, siteKey)
+		if err != nil || rc != nil {
+			return rc, err
+		}
+	}
+	all, err := s.store.Site.ListEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	jobCompany := strings.TrimSpace(job.CompanyName)
+	jobHost := hostOf(firstNonEmpty(job.SourceURL, job.OfficialURL, job.NormalizedURL))
+	for i := range all {
+		rc := &all[i]
+		if jobCompany != "" && strings.EqualFold(strings.TrimSpace(rc.CompanyName), jobCompany) {
+			return rc, nil
+		}
+		if jobHost != "" && strings.EqualFold(strings.TrimSpace(rc.Domain), jobHost) {
+			return rc, nil
+		}
+	}
+	return nil, nil
+}
+
+func isNavigableWebURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+func looksLikeJobListPage(text string) bool {
+	text = CleanText(text)
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(text, "搜索词-") || strings.Contains(lower, "search keyword") {
+		return true
+	}
+	hasCount := strings.Contains(text, "共") && (strings.Contains(text, "岗位") || strings.Contains(text, "职位"))
+	repeatedLocation := strings.Count(text, "工作地点") >= 2 || strings.Count(text, "工作城市") >= 2
+	return hasCount && repeatedLocation
+}
+
+func looksLikeJDDetailPage(text string) bool {
+	text = CleanText(text)
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"岗位职责", "工作职责", "职位职责", "工作内容",
+		"岗位要求", "任职要求", "职位要求", "资格要求",
+		"岗位描述", "职位描述", "职责描述",
+	}
+	hits := 0
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			hits++
+		}
+	}
+	return hits >= 2
 }
 
 // applyEnrichment 用补全后的正文重新解析、重新评分并回写数据库。
@@ -292,9 +547,18 @@ func (s *EnrichmentService) applyEnrichment(
 	}
 
 	fields := map[string]any{
-		"description":  pageText,
-		"desc_quality": string(DescQualityFull),
-		"crawled_at":   time.Now().UTC(),
+		"description":           pageText,
+		"desc_quality":          string(DescQualityFull),
+		"crawled_at":            time.Now().UTC(),
+		"enrichment_status":     model.EnrichmentStatusEnriched,
+		"enrichment_error":      "",
+		"enrichment_updated_at": time.Now().UTC(),
+	}
+	if isNavigableWebURL(job.SourceURL) {
+		fields["source_url"] = job.SourceURL
+	}
+	if isNavigableWebURL(job.OfficialURL) {
+		fields["official_url"] = job.OfficialURL
 	}
 	if parsed != nil {
 		if len(parsed.Responsibilities) > 0 {
@@ -462,6 +726,3 @@ func mustJSON(v any) string {
 	}
 	return string(b)
 }
-
-// 占位：确保 source 包被引用（RawJob 用于未来扩展补全结果回灌）。
-var _ = source.RawJob{}

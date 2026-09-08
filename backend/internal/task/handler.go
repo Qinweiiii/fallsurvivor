@@ -19,19 +19,28 @@ type SearchRunner interface {
 	Run(ctx context.Context, taskID uuid.UUID) error
 }
 
+// EnrichmentRunner 是 JD 补全任务需要实现的接口。
+type EnrichmentRunner interface {
+	RunEnrichment(ctx context.Context, userID uuid.UUID, jobIDs []uuid.UUID, maxJobs int, keyword string) error
+}
+
 // Handler 处理异步任务。
 type Handler struct {
-	search SearchRunner
+	search     SearchRunner
+	enrichment EnrichmentRunner
 }
 
 // NewHandler 创建处理器。
-func NewHandler(search SearchRunner) *Handler {
-	return &Handler{search: search}
+func NewHandler(search SearchRunner, enrichment EnrichmentRunner) *Handler {
+	return &Handler{search: search, enrichment: enrichment}
 }
 
 // Register 注册所有任务处理函数。
 func (h *Handler) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeJobSearch, h.handleJobSearch)
+	if h.enrichment != nil {
+		mux.HandleFunc(TypeJobEnrichJD, h.handleJobEnrichJD)
+	}
 }
 
 // handleJobSearch 执行岗位搜索任务。
@@ -59,5 +68,35 @@ func (h *Handler) handleJobSearch(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 	slog.Info("岗位搜索任务完成", "task_id", payload.TaskID)
+	return nil
+}
+
+// handleJobEnrichJD 执行 JD 补全任务。
+func (h *Handler) handleJobEnrichJD(ctx context.Context, t *asynq.Task) error {
+	var payload JobEnrichJDPayload
+	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+		return fmt.Errorf("解析补全任务载荷失败: %v: %w", err, asynq.SkipRetry)
+	}
+	userID, err := uuid.Parse(payload.UserID)
+	if err != nil {
+		return fmt.Errorf("非法的用户 ID: %w", asynq.SkipRetry)
+	}
+	jobIDs := make([]uuid.UUID, 0, len(payload.JobIDs))
+	for _, raw := range payload.JobIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("非法的岗位 ID: %w", asynq.SkipRetry)
+		}
+		jobIDs = append(jobIDs, id)
+	}
+	slog.Info("开始执行 JD 补全任务", "user_id", payload.UserID, "jobs", len(jobIDs))
+	if err := h.enrichment.RunEnrichment(ctx, userID, jobIDs, payload.MaxJobs, payload.Keyword); err != nil {
+		slog.Error("JD 补全任务执行失败", "user_id", payload.UserID, "error", err.Error())
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("补全任务被取消，不重试: %w", asynq.SkipRetry)
+		}
+		return err
+	}
+	slog.Info("JD 补全任务完成", "user_id", payload.UserID, "jobs", len(jobIDs))
 	return nil
 }
